@@ -46,7 +46,7 @@ class CompletionRequest(BaseModel):
     stream: bool = Field(default=False, description="Streaming response")
 
 class ChatMessage(BaseModel):
-    role: str = Field(..., regex="^(system|user|assistant)$")
+    role: str = Field(..., pattern="^(system|user|assistant)$")
     content: str
 
 class ChatCompletionRequest(BaseModel):
