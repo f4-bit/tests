@@ -6,18 +6,20 @@ pip install --upgrade pip
 
 # 4. Instalar dependencias
 echo "📥 Instalando FastAPI, Uvicorn y llama-cpp-python"
-pip install fastapi uvicorn
+pip install fastapi uvicorn aiohttp aiofiles sentence-transformers torch psutil httpx
 
 echo "Instalando hf hub"
 pip install huggingface-hub
+
+git clone https://github.com/ggerganov/llama.cpp
+cd llama.cpp
+make server
 
 # --- Opción CPU ---
 #pip install llama-cpp-python
 
 # --- Opción GPU NVIDIA (comenta la línea anterior y descomenta esta si quieres usar GPU CUDA 12.4) ---
-pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
+#pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
 
 # 5. Listo
 echo "✅ Instalación completada!"
-echo "Corriendo el entorno:"
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
