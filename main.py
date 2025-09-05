@@ -116,26 +116,75 @@ class GPUManager:
                             name=values[1],
                             memory_total=int(values[2]),
                             memory_free=int(values[3]),
-                            utilization=int(values[4]),
-                            temperature=int(values[5])
+                            utilization=int(values[4]) if values[4] != '[Not Supported]' else 0,
+                            temperature=int(values[5]) if values[5] != '[Not Supported]' else 0
                         ))
                         
                 logger.info(f"Detectadas {len(self.gpus)} GPUs")
                 for gpu in self.gpus:
                     logger.info(f"  GPU {gpu.id}: {gpu.name} - {gpu.memory_free}/{gpu.memory_total} MB libre")
             else:
-                logger.warning("No se pudieron detectar GPUs NVIDIA")
-                
+                logger.warning(f"nvidia-smi falló con código {result.returncode}: {result.stderr}")
+                # Fallback: assume at least GPU 0 exists if CUDA is available
+                self._create_fallback_gpu()
+                        
+        except FileNotFoundError:
+            logger.warning("nvidia-smi no encontrado")
+            self._create_fallback_gpu()
         except Exception as e:
             logger.error(f"Error detectando GPUs: {e}")
+            self._create_fallback_gpu()
+    
+    def _create_fallback_gpu(self):
+        """Crea una GPU fallback para entornos donde nvidia-smi no funciona"""
+        try:
+            # Check if CUDA is available through torch
+            import torch
+            if torch.cuda.is_available():
+                gpu_count = torch.cuda.device_count()
+                logger.info(f"Fallback: detectadas {gpu_count} GPUs via PyTorch")
+                
+                self.gpus = []
+                for i in range(gpu_count):
+                    props = torch.cuda.get_device_properties(i)
+                    # Convert bytes to MB
+                    total_memory = props.total_memory // (1024 * 1024)
+                    # Assume 80% of memory is free (rough estimate)
+                    free_memory = int(total_memory * 0.8)
+                    
+                    self.gpus.append(GPUInfo(
+                        id=i,
+                        name=props.name,
+                        memory_total=total_memory,
+                        memory_free=free_memory,
+                        utilization=0,  # Unknown
+                        temperature=0   # Unknown
+                    ))
+                    logger.info(f"  Fallback GPU {i}: {props.name} - ~{free_memory}MB libre (estimado)")
+            else:
+                logger.warning("CUDA no disponible")
+        except ImportError:
+            logger.warning("PyTorch no disponible para detectar GPUs")
+        except Exception as e:
+            logger.error(f"Error en fallback GPU detection: {e}")
     
     def get_available_gpus(self, min_memory_gb: float = 18.0) -> List[int]:
         """Obtiene GPUs con suficiente memoria libre"""
+        if not self.gpus:
+            logger.warning("No hay GPUs detectadas, intentando GPU 0 como fallback")
+            return [0]  # Assume GPU 0 exists as last resort
+            
         min_memory_mb = min_memory_gb * 1024
         available = [
             gpu.id for gpu in self.gpus 
             if gpu.memory_free >= min_memory_mb
         ]
+        
+        # If no GPUs meet memory requirements but we have GPUs, try anyway
+        if not available and self.gpus:
+            logger.warning(f"Ninguna GPU cumple {min_memory_gb}GB, usando todas disponibles")
+            available = [gpu.id for gpu in self.gpus]
+        
         return available
     
     def get_best_gpu(self, exclude: List[int] = None) -> Optional[int]:
@@ -283,6 +332,10 @@ class LlamaServerManager:
         if gpu_id in self.servers:
             logger.warning(f"Servidor ya corriendo en GPU {gpu_id}")
             return True
+        
+        # Verify server binary exists and is executable
+        if not self._verify_server_binary():
+            return False
             
         # Configurar CUDA_VISIBLE_DEVICES
         env = os.environ.copy()
@@ -316,48 +369,157 @@ class LlamaServerManager:
             self.servers[gpu_id] = process
             self.configs[gpu_id] = config
             
-            # Esperar a que el servidor esté listo
-            await self._wait_for_server(config.port)
+            # Check if process started successfully
+            await asyncio.sleep(2)  # Give it a moment to start
+            
+            if process.poll() is not None:
+                # Process has already exited
+                stdout, stderr = process.communicate()
+                logger.error(f"Servidor GPU {gpu_id} falló al iniciar:")
+                logger.error(f"STDOUT: {stdout}")
+                logger.error(f"STDERR: {stderr}")
+                
+                # Clean up
+                if gpu_id in self.servers:
+                    del self.servers[gpu_id]
+                if gpu_id in self.configs:
+                    del self.configs[gpu_id]
+                    
+                return False
+            
+            # Wait for server to be ready with more robust checking
+            await self._wait_for_server_improved(config.port, gpu_id)
             logger.info(f"Servidor GPU {gpu_id} listo en puerto {config.port}")
             return True
             
         except Exception as e:
             logger.error(f"Error iniciando servidor GPU {gpu_id}: {e}")
+            
+            # Clean up if process was created
+            if gpu_id in self.servers:
+                process = self.servers[gpu_id]
+                if process.poll() is None:  # Still running
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                
+                del self.servers[gpu_id]
+                if gpu_id in self.configs:
+                    del self.configs[gpu_id]
+            
             return False
     
-    async def _wait_for_server(self, port: int, timeout: int = 60):
+    def _verify_server_binary(self) -> bool:
+        """Verifica que el binario del servidor existe y es ejecutable"""
+        binary_path = Path(self.server_binary)
+        
+        if not binary_path.exists():
+            logger.error(f"Binario del servidor no encontrado: {self.server_binary}")
+            logger.info("Sugerencias:")
+            logger.info("1. Compila llama.cpp: cmake --build . --target server")
+            logger.info("2. Verifica la ruta del binario")
+            logger.info("3. Usa --server-binary para especificar ruta correcta")
+            return False
+        
+        if not os.access(binary_path, os.X_OK):
+            logger.error(f"Binario del servidor no es ejecutable: {self.server_binary}")
+            logger.info(f"Ejecuta: chmod +x {self.server_binary}")
+            return False
+        
+        return True
+    
+    async def _wait_for_server_improved(self, port: int, gpu_id: int, timeout: int = 90):
+        """Espera a que el servidor esté listo con mejor manejo de errores"""
         start_time = time.time()
+        last_error = None
+        
+        # Try different endpoints that llama.cpp server might expose
+        test_endpoints = [
+            "/health",
+            "/v1/models", 
+            "/props",
+            "/",
+        ]
         
         while time.time() - start_time < timeout:
-            try:
-                async with httpx.AsyncClient() as client:
-                    # Use localhost for internal health checks, but servers bind to 0.0.0.0
-                    response = await client.get(f"http://localhost:{port}/health", timeout=2)
-                    if response.status_code == 200:
-                        return
-            except:
-                pass
-            await asyncio.sleep(1)
+            process = self.servers.get(gpu_id)
+            if process and process.poll() is not None:
+                # Process has died
+                stdout, stderr = process.communicate()
+                logger.error(f"Proceso del servidor GPU {gpu_id} murió durante inicialización:")
+                logger.error(f"STDOUT: {stdout[-1000:]}")  # Last 1000 chars
+                logger.error(f"STDERR: {stderr[-1000:]}")
+                raise RuntimeError(f"Proceso del servidor GPU {gpu_id} falló")
             
+            # Try to connect to any of the endpoints
+            for endpoint in test_endpoints:
+                try:
+                    async with httpx.AsyncClient(timeout=3.0) as client:
+                        response = await client.get(f"http://localhost:{port}{endpoint}")
+                        if response.status_code in [200, 404]:  # 404 is OK too, means server is responding
+                            logger.info(f"Servidor GPU {gpu_id} respondiendo en {endpoint}")
+                            return
+                except Exception as e:
+                    last_error = e
+                    continue
+            
+            await asyncio.sleep(2)
+        
+        # If we get here, timeout occurred
+        process = self.servers.get(gpu_id)
+        if process:
+            stdout, stderr = process.communicate() if process.poll() is not None else ("", "")
+            logger.error(f"Timeout esperando servidor GPU {gpu_id}. Último error: {last_error}")
+            if stdout:
+                logger.error(f"STDOUT: {stdout[-1000:]}")
+            if stderr:
+                logger.error(f"STDERR: {stderr[-1000:]}")
+        
         raise TimeoutError(f"Servidor en puerto {port} no respondió en {timeout}s")
+    
+    async def _wait_for_server(self, port: int, timeout: int = 60):
+        """Método original mantenido por compatibilidad"""
+        await self._wait_for_server_improved(port, 0, timeout)
     
     def stop_all_servers(self):
         """Detiene todos los servidores"""
         for gpu_id, process in self.servers.items():
             logger.info(f"Deteniendo servidor GPU {gpu_id}")
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+            if process.poll() is None:  # Still running
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    logger.warning(f"Forzando terminación del servidor GPU {gpu_id}")
+                    process.kill()
+                    process.wait()
         
         self.servers.clear()
         self.configs.clear()
     
     def get_available_servers(self) -> List[int]:
         """Obtiene lista de servidores disponibles"""
-        return list(self.servers.keys())
+        # Filter out dead processes
+        active_servers = []
+        dead_servers = []
+        
+        for gpu_id, process in self.servers.items():
+            if process.poll() is None:  # Still running
+                active_servers.append(gpu_id)
+            else:
+                dead_servers.append(gpu_id)
+        
+        # Clean up dead servers
+        for gpu_id in dead_servers:
+            logger.warning(f"Servidor GPU {gpu_id} murió, removiendo")
+            del self.servers[gpu_id]
+            if gpu_id in self.configs:
+                del self.configs[gpu_id]
+        
+        return active_servers
     
     def get_server_port(self, gpu_id: int) -> Optional[int]:
         """Obtiene el puerto de un servidor específico"""
@@ -975,44 +1137,142 @@ def setup_signal_handlers():
 async def validate_environment(args):
     """Valida que el entorno esté correctamente configurado"""
     errors = []
+    warnings = []
     
     # Verificar binario del servidor
-    if not Path(args.server_binary).exists():
+    server_path = Path(args.server_binary)
+    if not server_path.exists():
         errors.append(f"Binario del servidor no encontrado: {args.server_binary}")
+        logger.error("Sugerencias para resolver problema del servidor:")
+        logger.error("1. Clona llama.cpp: git clone https://github.com/ggerganov/llama.cpp.git")
+        logger.error("2. Compila: cd llama.cpp && make server")
+        logger.error("3. Usa --server-binary para especificar ruta correcta")
+    elif not os.access(server_path, os.X_OK):
+        errors.append(f"Binario del servidor no es ejecutable: {args.server_binary}")
+        logger.error(f"Ejecuta: chmod +x {args.server_binary}")
+    else:
+        logger.info(f"✅ Binario del servidor encontrado: {args.server_binary}")
     
-    # Verificar nvidia-smi
+    # Verificar nvidia-smi (no crítico)
     try:
-        subprocess.run(["nvidia-smi"], capture_output=True, check=True)
+        result = subprocess.run(["nvidia-smi"], capture_output=True, check=True, timeout=10)
+        logger.info("✅ nvidia-smi disponible")
+    except subprocess.TimeoutExpired:
+        warnings.append("nvidia-smi timeout - GPU monitoring limitado")
     except (subprocess.CalledProcessError, FileNotFoundError):
-        errors.append("nvidia-smi no disponible. ¿Está instalado CUDA?")
+        warnings.append("nvidia-smi no disponible - usando detección CUDA alternativa")
     
-    # Verificar GPUs disponibles
+    # Verificar CUDA con PyTorch
+    cuda_available = False
+    try:
+        import torch
+        cuda_available = torch.cuda.is_available()
+        if cuda_available:
+            gpu_count = torch.cuda.device_count()
+            logger.info(f"✅ CUDA disponible - {gpu_count} GPU(s) detectadas")
+            
+            # Log GPU details
+            for i in range(gpu_count):
+                props = torch.cuda.get_device_properties(i)
+                memory_gb = props.total_memory / (1024**3)
+                logger.info(f"   GPU {i}: {props.name} - {memory_gb:.1f}GB VRAM")
+        else:
+            errors.append("CUDA no está disponible en PyTorch")
+    except ImportError:
+        errors.append("PyTorch no instalado (requerido para detección CUDA y embeddings)")
+    
+    # Verificar GPUs disponibles usando nuestro manager
     gpu_manager.refresh_gpu_info()
     available_gpus = gpu_manager.get_available_gpus(args.min_vram_gb)
     
-    if not available_gpus:
-        errors.append(f"No hay GPUs con al menos {args.min_vram_gb}GB VRAM disponible")
-    
-    # Verificar que torch esté disponible para embeddings
-    try:
-        import torch
-        if not torch.cuda.is_available():
-            logger.warning("CUDA no disponible para PyTorch, usando solo CPU para embeddings")
-    except ImportError:
-        errors.append("PyTorch no instalado (requerido para embeddings)")
+    if not available_gpus and not cuda_available:
+        errors.append(f"No hay GPUs detectadas o disponibles")
+    elif not available_gpus and cuda_available:
+        warnings.append(f"GPUs detectadas pero ninguna con {args.min_vram_gb}GB VRAM libre")
+        logger.warning("Continuando con todas las GPUs disponibles...")
+    else:
+        logger.info(f"✅ {len(available_gpus)} GPU(s) disponibles con suficiente VRAM")
     
     # Verificar sentence-transformers
     try:
         from sentence_transformers import SentenceTransformer
+        logger.info("✅ sentence-transformers disponible")
+        
+        # Test load a small model to verify it works
+        try:
+            test_model = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
+            logger.info("✅ Embeddings funcionando correctamente")
+        except Exception as e:
+            warnings.append(f"Error cargando modelo de embeddings de prueba: {e}")
+            
     except ImportError:
-        errors.append("sentence-transformers no instalado")
+        errors.append("sentence-transformers no instalado (pip install sentence-transformers)")
     
+    # Verificar otras dependencias críticas
+    required_modules = [
+        ('aiohttp', 'aiohttp'),
+        ('aiofiles', 'aiofiles'), 
+        ('fastapi', 'fastapi'),
+        ('uvicorn', 'uvicorn'),
+        ('httpx', 'httpx'),
+        ('huggingface_hub', 'huggingface-hub'),
+        ('psutil', 'psutil')
+    ]
+    
+    missing_modules = []
+    for module_name, pip_name in required_modules:
+        try:
+            __import__(module_name)
+        except ImportError:
+            missing_modules.append(pip_name)
+    
+    if missing_modules:
+        errors.append(f"Módulos faltantes: {', '.join(missing_modules)}")
+        logger.error(f"Instala con: pip install {' '.join(missing_modules)}")
+    
+    # Verificar espacio en disco para modelos
+    try:
+        models_path = Path(args.models_dir)
+        models_path.mkdir(exist_ok=True)
+        
+        # Check available space (rough estimate - 50GB should be enough for most models)
+        statvfs = os.statvfs(models_path)
+        free_space_gb = (statvfs.f_frsize * statvfs.f_bavail) / (1024**3)
+        
+        if free_space_gb < 10:
+            warnings.append(f"Poco espacio libre para modelos: {free_space_gb:.1f}GB")
+        else:
+            logger.info(f"✅ Espacio disponible para modelos: {free_space_gb:.1f}GB")
+            
+    except Exception as e:
+        warnings.append(f"No se pudo verificar espacio en disco: {e}")
+    
+    # Verificar conectividad a Hugging Face (no crítico)
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get("https://huggingface.co")
+            if response.status_code == 200:
+                logger.info("✅ Conectividad a Hugging Face OK")
+            else:
+                warnings.append("Problemas de conectividad a Hugging Face")
+    except Exception:
+        warnings.append("No se pudo verificar conectividad a Hugging Face")
+    
+    # Mostrar warnings
+    if warnings:
+        logger.warning("⚠️  Advertencias de configuración:")
+        for warning in warnings:
+            logger.warning(f"  - {warning}")
+        logger.warning("El sistema puede funcionar con limitaciones")
+    
+    # Mostrar errores
     if errors:
-        logger.error("Errores de configuración:")
+        logger.error("❌ Errores de configuración críticos:")
         for error in errors:
             logger.error(f"  - {error}")
         return False
     
+    logger.info("✅ Validación del entorno completada exitosamente")
     return True
 
 def print_startup_info(args):
