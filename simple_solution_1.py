@@ -8,19 +8,14 @@ from huggingface_hub import hf_hub_download
 # Configura la GPU 0 (RTX 5090)
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-model_path = hf_hub_download(
-    repo_id="Qwen/Qwen2.5-Coder-32B-Instruct-GGUF",
-    filename="Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf",
-    repo_type="model"
-)
-
 # Inicializa el modelo con parámetros específicos
-llm = Llama(
-    model_path=model_path,
-    n_gpu_layers=-1,  # Offload todas las capas a la GPU
-    n_batch=512,      # Tamaño del batch para procesamiento (ajusta si es necesario)
-    n_ctx=4096,       # Tamaño del contexto (ajusta según necesidad)
-    verbose=True      # Para depuración
+llm = Llama.from_pretrained(
+    repo_id="Qwen/Qwen2.5-Coder-32B-Instruct-GGUF",
+    filename="qwen2.5-coder-32b-instruct-q4_k_m.gguf",
+    n_gpu_layers=-1,
+    n_batch=512,
+    n_ctx=4096,
+    verbose=True
 )
 
 # Crea la aplicación FastAPI usando el servidor de llama-cpp-python
