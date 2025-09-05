@@ -291,7 +291,7 @@ class LlamaServerManager:
         cmd = [
             self.server_binary,
             "-m", str(config.model_path),
-            "--host", "127.0.0.1",
+            "--host", "0.0.0.0",
             "--port", str(config.port),
             "-c", str(config.context_size),
             "-np", str(config.parallel_requests),
@@ -1044,6 +1044,7 @@ def print_startup_info(args):
     
     print("="*80 + "\n")
 
+'''
 class HealthCheckServer:
     """Servidor de health check independiente para monitoreo"""
     
@@ -1090,7 +1091,7 @@ class HealthCheckServer:
                 ])
             
             return "\n".join(metrics)
-
+'''
 async def main():
     """Función principal"""
     args = parse_arguments()
@@ -1135,6 +1136,7 @@ async def main():
     # Inyectar args en el estado de la app para el lifespan
     app.state.args = args
     
+    '''
     # Iniciar servidor de health check independiente
     health_server = HealthCheckServer()
     health_config = uvicorn.Config(
@@ -1145,7 +1147,7 @@ async def main():
         access_log=False
     )
     health_server_instance = uvicorn.Server(health_config)
-    
+    '''
     # Configurar servidor principal
     config = uvicorn.Config(
         app,
@@ -1164,7 +1166,7 @@ async def main():
         logger.info("Iniciando servidores...")
         
         async with asyncio.TaskGroup() as tg:
-            tg.create_task(health_server_instance.serve())
+            #tg.create_task(health_server_instance.serve())
             tg.create_task(server.serve())
             
     except KeyboardInterrupt:
