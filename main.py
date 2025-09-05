@@ -138,7 +138,6 @@ class GPUManager:
     def _create_fallback_gpu(self):
         """Crea una GPU fallback para entornos donde nvidia-smi no funciona"""
         try:
-            # Check if CUDA is available through torch
             import torch
             if torch.cuda.is_available():
                 gpu_count = torch.cuda.device_count()
@@ -178,7 +177,7 @@ class GPUManager:
         min_memory_mb = min_memory_gb * 1024
         available = [
             gpu.id for gpu in self.gpus 
-            if gpu.memory_free >= min_memory_mb or gpu.memory_total == 0  # Allow fallback GPU
+            if gpu.memory_free >= min_memory_mb or gpu.memory_total == 0
         ]
         
         if not available:
@@ -193,7 +192,7 @@ class GPUManager:
         available_gpus = [gpu for gpu in self.gpus if gpu.id not in exclude]
         
         if not available_gpus:
-            return 0  # Default to GPU 0 if none available
+            return 0
             
         best_gpu = max(available_gpus, key=lambda g: g.memory_free)
         return best_gpu.id
@@ -375,7 +374,6 @@ class LlamaServerManager:
         if not self._verify_server_binary():
             return False
         
-        # Verificar puerto
         if not self._check_port_available(config.port):
             logger.error(f"No se puede iniciar servidor en GPU {gpu_id}: puerto {config.port} ocupado")
             return False
@@ -470,19 +468,32 @@ class LlamaServerManager:
         dead_servers = []
         
         for gpu_id, process in self.servers.items():
-            if process.poll() is None and self._server_ready.get(gpu_id, False):
-                active_servers.append(gpu_id)
-            elif process.poll() is not None:
+            try:
+                # Verificar si el proceso está realmente vivo
+                proc = psutil.Process(process.pid)
+                if proc.is_running() and self._server_ready.get(gpu_id, False):
+                    active_servers.append(gpu_id)
+                    logger.debug(f"Servidor GPU {gpu_id} (PID {process.pid}) está vivo y listo")
+                else:
+                    dead_servers.append(gpu_id)
+                    logger.warning(f"Servidor GPU {gpu_id} (PID {process.pid}) no está listo o murió")
+            except psutil.NoSuchProcess:
+                dead_servers.append(gpu_id)
+                logger.warning(f"Servidor GPU {gpu_id} (PID {process.pid}) no existe")
+            except Exception as e:
+                logger.error(f"Error verificando servidor GPU {gpu_id}: {e}")
                 dead_servers.append(gpu_id)
         
         for gpu_id in dead_servers:
-            logger.warning(f"Servidor GPU {gpu_id} murió, removiendo")
-            del self.servers[gpu_id]
+            logger.warning(f"Removiendo servidor muerto GPU {gpu_id}")
+            if gpu_id in self.servers:
+                del self.servers[gpu_id]
             if gpu_id in self.configs:
                 del self.configs[gpu_id]
             if gpu_id in self._server_ready:
                 del self._server_ready[gpu_id]
         
+        logger.info(f"Servidores activos: {active_servers}")
         return active_servers
     
     async def _wait_for_server_improved(self, port: int, gpu_id: int, timeout: int = 600):
@@ -503,7 +514,7 @@ class LlamaServerManager:
             
             for endpoint in test_endpoints:
                 try:
-                    async with httpx.AsyncClient(timeout=5.0) as client:
+                    async with httpx.AsyncClient(timeout=10.0) as client:  # Increased timeout
                         response = await client.get(f"http://127.0.0.1:{port}{endpoint}")
                         if response.status_code in [200, 404, 405]:
                             logger.info(f"✅ Servidor GPU {gpu_id} respondiendo en {endpoint} (status: {response.status_code})")
@@ -562,26 +573,33 @@ class LoadBalancer:
         """Verifica si un servidor específico está respondiendo"""
         port = self.server_manager.get_server_port(gpu_id)
         if not port:
+            logger.error(f"No se encontró puerto para GPU {gpu_id}")
             return False
         
         now = time.time()
         if gpu_id in self._last_health_check:
             if now - self._last_health_check[gpu_id] < 5:
+                logger.debug(f"Health check cacheado para GPU {gpu_id}: True")
                 return True
         
         try:
-            async with httpx.AsyncClient(timeout=2.0) as client:
+            async with httpx.AsyncClient(timeout=10.0) as client:  # Increased timeout
                 for endpoint in ["/health", "/v1/models", "/props"]:
                     try:
                         response = await client.get(f"http://127.0.0.1:{port}{endpoint}")
                         if response.status_code in [200, 404]:
+                            logger.debug(f"Health check exitoso para GPU {gpu_id} en {endpoint} (status: {response.status_code})")
                             self._last_health_check[gpu_id] = now
                             return True
-                    except:
+                        else:
+                            logger.debug(f"Health check falló para GPU {gpu_id} en {endpoint}: status {response.status_code}")
+                    except Exception as e:
+                        logger.debug(f"Health check falló para GPU {gpu_id} en {endpoint}: {e}")
                         continue
+                logger.error(f"Todos los endpoints de health check fallaron para GPU {gpu_id}")
                 return False
         except Exception as e:
-            logger.debug(f"Health check failed for GPU {gpu_id}: {e}")
+            logger.error(f"Error en health check para GPU {gpu_id}: {e}")
             return False
     
     async def get_available_servers(self) -> List[int]:
@@ -601,9 +619,13 @@ class LoadBalancer:
         for gpu_id, is_healthy in zip(running_servers, health_checks):
             if is_healthy is True:
                 available_servers.append(gpu_id)
+                logger.debug(f"Servidor GPU {gpu_id} marcado como disponible")
             elif isinstance(is_healthy, Exception):
-                logger.debug(f"Health check exception for GPU {gpu_id}: {is_healthy}")
+                logger.error(f"Excepción en health check para GPU {gpu_id}: {is_healthy}")
+            else:
+                logger.warning(f"Servidor GPU {gpu_id} no responde a health checks")
         
+        logger.info(f"Servidores disponibles después de health checks: {available_servers}")
         return available_servers
     
     async def get_next_server(self) -> Optional[int]:
@@ -625,6 +647,7 @@ class LoadBalancer:
         gpu_id = available_servers[self.current_server]
         self.current_server += 1
         
+        logger.debug(f"Seleccionado servidor GPU {gpu_id} (round-robin)")
         return gpu_id
     
     async def get_best_server(self) -> Optional[int]:
@@ -632,6 +655,7 @@ class LoadBalancer:
         available_servers = await self.get_available_servers()
         
         if not available_servers:
+            logger.error("No hay servidores disponibles para seleccionar")
             return None
         
         if not any(server in self.server_stats for server in available_servers):
@@ -642,6 +666,7 @@ class LoadBalancer:
             key=lambda s: self.server_stats.get(s, {"requests": 0})["requests"]
         )
         
+        logger.debug(f"Seleccionado mejor servidor GPU {best_server}")
         return best_server
     
     def update_server_stats(self, gpu_id: int, processing_time: float):
@@ -806,7 +831,7 @@ async def lifespan(app: FastAPI):
         
         tasks = []
         for i, gpu_id in enumerate(available_gpus[:args.max_gpus]):
-            port = 8080 + i  # Use index to avoid port conflicts
+            port = 8080 + i
             config = LlamaServerConfig(
                 gpu_id=gpu_id,
                 port=port,
@@ -906,7 +931,6 @@ async def stream_completion(request: CompletionRequest):
             async for chunk in client.generate_completion_stream(request):
                 yield chunk
         except AttributeError:
-            # Fallback si generate_completion_stream no está implementado
             result = await client.generate_completion(request)
             yield f"data: {json.dumps(result)}\n\n"
         yield "data: [DONE]\n\n"
