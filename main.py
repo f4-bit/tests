@@ -23,6 +23,8 @@ import uvicorn
 from sentence_transformers import SentenceTransformer
 import torch
 import httpx
+from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub.utils import HfHubHTTPError
 
 # Configuración de logging
 logging.basicConfig(
@@ -148,62 +150,108 @@ class GPUManager:
         return best_gpu.id
 
 # ============================================================================
-# Descarga de Modelos
+# Descarga de Modelos - FIXED VERSION
 # ============================================================================
 
 class ModelDownloader:
-    """Descarga modelos de Hugging Face"""
+    """Descarga modelos de Hugging Face usando huggingface_hub oficial"""
     
     def __init__(self, base_dir: str = "./models"):
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(exist_ok=True)
         
     async def download_model(self, repo_id: str, filename: str) -> Path:
-        """Descarga un modelo específico de HuggingFace"""
-        model_path = self.base_dir / repo_id.replace("/", "_") / filename
-        
-        if model_path.exists():
-            logger.info(f"Modelo ya existe: {model_path}")
-            return model_path
-            
-        model_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # URL de Hugging Face
-        url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
-        
-        logger.info(f"Descargando modelo: {repo_id}/{filename}")
-        logger.info(f"URL: {url}")
-        
+        """Descarga un modelo específico de HuggingFace usando huggingface_hub"""
         try:
-            async with httpx.AsyncClient(timeout=3600) as client:  # 1 hora timeout
-                async with client.stream("GET", url) as response:
-                    if response.status_code != 200:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"Error descargando modelo: HTTP {response.status_code}"
-                        )
-                    
-                    total_size = int(response.headers.get("content-length", 0))
-                    downloaded = 0
-                    
-                    async with aiofiles.open(model_path, 'wb') as f:
-                        async for chunk in response.aiter_bytes(chunk_size=8192):
-                            await f.write(chunk)
-                            downloaded += len(chunk)
-                            
-                            # Log progreso cada 100MB
-                            if downloaded % (100 * 1024 * 1024) == 0 and total_size > 0:
-                                progress = (downloaded / total_size) * 100
-                                logger.info(f"Descarga: {progress:.1f}% ({downloaded // (1024*1024)}MB)")
+            logger.info(f"Verificando modelo: {repo_id}/{filename}")
             
-            logger.info(f"Modelo descargado: {model_path}")
+            # Usar el método oficial de huggingface_hub que maneja redirecciones automáticamente
+            model_path = await asyncio.to_thread(
+                self._sync_download_model, 
+                repo_id, 
+                filename
+            )
+            
+            logger.info(f"Modelo disponible en: {model_path}")
+            return Path(model_path)
+            
+        except HfHubHTTPError as e:
+            logger.error(f"Error de Hugging Face Hub: {e}")
+            if e.response.status_code == 404:
+                raise HTTPException(
+                    status_code=404, 
+                    detail=f"Modelo no encontrado: {repo_id}/{filename}"
+                )
+            elif e.response.status_code == 401:
+                raise HTTPException(
+                    status_code=401, 
+                    detail="Token de Hugging Face requerido para este modelo privado"
+                )
+            else:
+                raise HTTPException(
+                    status_code=500, 
+                    detail=f"Error descargando modelo: HTTP {e.response.status_code}"
+                )
+        except Exception as e:
+            logger.error(f"Error descargando modelo: {str(e)}")
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Error descargando modelo: {str(e)}"
+            )
+    
+    def _sync_download_model(self, repo_id: str, filename: str) -> str:
+        """Descarga síncrona usando huggingface_hub oficial"""
+        try:
+            logger.info(f"Descargando {filename} desde {repo_id}...")
+            
+            # Método principal: usar hf_hub_download
+            model_path = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                cache_dir=str(self.base_dir),
+                resume_download=True,  # Reanuda descargas interrumpidas
+                local_files_only=False,  # Permite descarga desde internet
+            )
+            
+            logger.info(f"Descarga completada: {model_path}")
             return model_path
             
         except Exception as e:
-            # Limpiar archivo parcial
-            if model_path.exists():
-                model_path.unlink()
-            raise HTTPException(status_code=500, detail=f"Error descargando modelo: {str(e)}")
+            logger.error(f"Error en hf_hub_download: {e}")
+            
+            # Método fallback: usar snapshot_download
+            try:
+                logger.info("Intentando con snapshot_download como fallback...")
+                
+                snapshot_path = snapshot_download(
+                    repo_id=repo_id,
+                    cache_dir=str(self.base_dir),
+                    resume_download=True,
+                    allow_patterns=[filename],  # Solo descargar el archivo específico
+                )
+                
+                model_path = os.path.join(snapshot_path, filename)
+                if os.path.exists(model_path):
+                    logger.info(f"Descarga fallback completada: {model_path}")
+                    return model_path
+                else:
+                    raise FileNotFoundError(f"Archivo {filename} no encontrado en snapshot")
+                    
+            except Exception as e2:
+                logger.error(f"Error en snapshot_download: {e2}")
+                raise e  # Re-raise el error original
+
+    async def check_model_exists(self, model_path: str) -> bool:
+        """Verifica si el modelo ya existe localmente"""
+        try:
+            path = Path(model_path)
+            if path.exists() and path.stat().st_size > 0:
+                logger.info(f"Modelo encontrado localmente: {model_path}")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Error verificando modelo: {e}")
+            return False
 
 # ============================================================================
 # Servidor Llama.cpp
@@ -483,7 +531,7 @@ class LlamaClient:
                         try:
                             data = json.loads(line_str[6:])
                             if 'content' in data:
-                                yield f"data: {json.dumps(data)}\\n\\n"
+                                yield f"data: {json.dumps(data)}\n\n"
                         except json.JSONDecodeError:
                             continue
                 
@@ -492,7 +540,7 @@ class LlamaClient:
                 
         except Exception as e:
             logger.error(f"Error en streaming GPU {gpu_id}: {e}")
-            yield f"data: {json.dumps({'error': str(e)})}\\n\\n"
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
 # ============================================================================
 # Gestor de Embeddings
@@ -547,7 +595,7 @@ embedding_manager = EmbeddingManager()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Gestión del ciclo de vida de la aplicación"""
-    logger.info("🚀 Iniciando sistema Multi-GPU Llama.cpp")
+    logger.info("Iniciando sistema Multi-GPU Llama.cpp")
     
     # Configuración pasada por argumentos (se inyecta desde main)
     args = app.state.args
@@ -597,14 +645,14 @@ async def lifespan(app: FastAPI):
         logger.info(f"Precargando modelo de embeddings: {args.embedding_model}")
         await embedding_manager.load_model(args.embedding_model)
         
-        logger.info("🎉 Sistema listo para recibir requests")
+        logger.info("Sistema listo para recibir requests")
         
         yield
         
     finally:
-        logger.info("🛑 Deteniendo sistema...")
+        logger.info("Deteniendo sistema...")
         server_manager.stop_all_servers()
-        logger.info("✅ Sistema detenido correctamente")
+        logger.info("Sistema detenido correctamente")
 
 # Crear app FastAPI
 app = FastAPI(
@@ -668,7 +716,7 @@ async def stream_completion(request: CompletionRequest):
     async with LlamaClient(load_balancer) as client:
         async for chunk in client.generate_completion_stream(request):
             yield chunk
-        yield "data: [DONE]\\n\\n"
+        yield "data: [DONE]\n\n"
 
 @app.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest):
@@ -708,7 +756,7 @@ def messages_to_prompt(messages: List[ChatMessage]) -> str:
             prompt_parts.append(f"Assistant: {message.content}")
     
     prompt_parts.append("Assistant:")
-    return "\\n".join(prompt_parts)
+    return "\n".join(prompt_parts)
 
 @app.post("/v1/embeddings", response_model=EmbeddingResponse)
 async def create_embeddings(request: EmbeddingRequest):
@@ -1092,7 +1140,7 @@ async def main():
     health_config = uvicorn.Config(
         health_server.app,
         host=args.host,
-        port=8080,
+        port=3001,  # Puerto diferente para health check
         log_level=args.log_level.lower(),
         access_log=False
     )
@@ -1113,53 +1161,20 @@ async def main():
     
     try:
         # Iniciar ambos servidores
-        logger.info("🚀 Iniciando servidores...")
+        logger.info("Iniciando servidores...")
         
         async with asyncio.TaskGroup() as tg:
             tg.create_task(health_server_instance.serve())
             tg.create_task(server.serve())
             
     except KeyboardInterrupt:
-        logger.info("👋 Deteniendo por solicitud del usuario")
+        logger.info("Deteniendo por solicitud del usuario")
     except Exception as e:
-        logger.error(f"❌ Error crítico: {e}")
+        logger.error(f"Error crítico: {e}")
         sys.exit(1)
     finally:
-        logger.info("🛑 Limpiando recursos...")
+        logger.info("Limpiando recursos...")
         server_manager.stop_all_servers()
 
 if __name__ == "__main__":
-    # Ejemplo de uso en comentarios
-    """
-    Ejemplos de uso:
-    
-    # Uso básico (detecta todas las GPUs automáticamente)
-    python multi_gpu_api.py
-    
-    # Especificar modelo y configuración
-    python multi_gpu_api.py \
-        --repo-id "unsloth/Qwen2.5-Coder-32B-Instruct-GGUF" \
-        --model-filename "Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf" \
-        --context-size 32768 \
-        --max-output-tokens 4096 \
-        --parallel-requests 3 \
-        --max-gpus 2
-    
-    # Usar GPUs específicas
-    python multi_gpu_api.py --gpu-ids "0,1" --parallel-requests 2
-    
-    # Configuración para memoria limitada
-    python multi_gpu_api.py \
-        --min-vram-gb 12 \
-        --context-size 16384 \
-        --parallel-requests 1 \
-        --batch-size 256
-    
-    # Desarrollo con logs detallados
-    python multi_gpu_api.py \
-        --log-level DEBUG \
-        --log-file "api.log" \
-        --host "127.0.0.1"
-    """
-    
     asyncio.run(main())
