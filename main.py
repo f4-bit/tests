@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Any, AsyncGenerator
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
+import socket
 
 import psutil
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -125,7 +126,6 @@ class GPUManager:
                     logger.info(f"  GPU {gpu.id}: {gpu.name} - {gpu.memory_free}/{gpu.memory_total} MB libre")
             else:
                 logger.warning(f"nvidia-smi falló con código {result.returncode}: {result.stderr}")
-                # Fallback: assume at least GPU 0 exists if CUDA is available
                 self._create_fallback_gpu()
                         
         except FileNotFoundError:
@@ -147,9 +147,7 @@ class GPUManager:
                 self.gpus = []
                 for i in range(gpu_count):
                     props = torch.cuda.get_device_properties(i)
-                    # Convert bytes to MB
                     total_memory = props.total_memory // (1024 * 1024)
-                    # Assume 80% of memory is free (rough estimate)
                     free_memory = int(total_memory * 0.8)
                     
                     self.gpus.append(GPUInfo(
@@ -157,31 +155,33 @@ class GPUManager:
                         name=props.name,
                         memory_total=total_memory,
                         memory_free=free_memory,
-                        utilization=0,  # Unknown
-                        temperature=0   # Unknown
+                        utilization=0,
+                        temperature=0
                     ))
                     logger.info(f"  Fallback GPU {i}: {props.name} - ~{free_memory}MB libre (estimado)")
             else:
-                logger.warning("CUDA no disponible")
+                logger.warning("CUDA no disponible, asumiendo GPU 0")
+                self.gpus = [GPUInfo(id=0, name="Unknown", memory_total=0, memory_free=0, utilization=0, temperature=0)]
         except ImportError:
-            logger.warning("PyTorch no disponible para detectar GPUs")
+            logger.warning("PyTorch no disponible, asumiendo GPU 0")
+            self.gpus = [GPUInfo(id=0, name="Unknown", memory_total=0, memory_free=0, utilization=0, temperature=0)]
         except Exception as e:
             logger.error(f"Error en fallback GPU detection: {e}")
+            self.gpus = [GPUInfo(id=0, name="Unknown", memory_total=0, memory_free=0, utilization=0, temperature=0)]
     
     def get_available_gpus(self, min_memory_gb: float = 18.0) -> List[int]:
         """Obtiene GPUs con suficiente memoria libre"""
         if not self.gpus:
             logger.warning("No hay GPUs detectadas, intentando GPU 0 como fallback")
-            return [0]  # Assume GPU 0 exists as last resort
+            return [0]
             
         min_memory_mb = min_memory_gb * 1024
         available = [
             gpu.id for gpu in self.gpus 
-            if gpu.memory_free >= min_memory_mb
+            if gpu.memory_free >= min_memory_mb or gpu.memory_total == 0  # Allow fallback GPU
         ]
         
-        # If no GPUs meet memory requirements but we have GPUs, try anyway
-        if not available and self.gpus:
+        if not available:
             logger.warning(f"Ninguna GPU cumple {min_memory_gb}GB, usando todas disponibles")
             available = [gpu.id for gpu in self.gpus]
         
@@ -193,13 +193,13 @@ class GPUManager:
         available_gpus = [gpu for gpu in self.gpus if gpu.id not in exclude]
         
         if not available_gpus:
-            return None
+            return 0  # Default to GPU 0 if none available
             
         best_gpu = max(available_gpus, key=lambda g: g.memory_free)
         return best_gpu.id
 
 # ============================================================================
-# Descarga de Modelos - FIXED VERSION
+# Descarga de Modelos
 # ============================================================================
 
 class ModelDownloader:
@@ -214,7 +214,6 @@ class ModelDownloader:
         try:
             logger.info(f"Verificando modelo: {repo_id}/{filename}")
             
-            # Usar el método oficial de huggingface_hub que maneja redirecciones automáticamente
             model_path = await asyncio.to_thread(
                 self._sync_download_model, 
                 repo_id, 
@@ -253,13 +252,12 @@ class ModelDownloader:
         try:
             logger.info(f"Descargando {filename} desde {repo_id}...")
             
-            # Método principal: usar hf_hub_download
             model_path = hf_hub_download(
                 repo_id=repo_id,
                 filename=filename,
                 cache_dir=str(self.base_dir),
-                resume_download=True,  # Reanuda descargas interrumpidas
-                local_files_only=False,  # Permite descarga desde internet
+                resume_download=True,
+                local_files_only=False,
             )
             
             logger.info(f"Descarga completada: {model_path}")
@@ -268,7 +266,6 @@ class ModelDownloader:
         except Exception as e:
             logger.error(f"Error en hf_hub_download: {e}")
             
-            # Método fallback: usar snapshot_download
             try:
                 logger.info("Intentando con snapshot_download como fallback...")
                 
@@ -276,7 +273,7 @@ class ModelDownloader:
                     repo_id=repo_id,
                     cache_dir=str(self.base_dir),
                     resume_download=True,
-                    allow_patterns=[filename],  # Solo descargar el archivo específico
+                    allow_patterns=[filename],
                 )
                 
                 model_path = os.path.join(snapshot_path, filename)
@@ -288,7 +285,7 @@ class ModelDownloader:
                     
             except Exception as e2:
                 logger.error(f"Error en snapshot_download: {e2}")
-                raise e  # Re-raise el error original
+                raise e
 
     async def check_model_exists(self, model_path: str) -> bool:
         """Verifica si el modelo ya existe localmente"""
@@ -321,23 +318,53 @@ class LlamaServerManager:
     
     def __init__(self, server_binary: str = "./server"):
         self.server_binary = server_binary
-        self.servers: Dict[int, subprocess.Popen] = {}  # gpu_id -> process
+        self.servers: Dict[int, subprocess.Popen] = {}
         self.configs: Dict[int, LlamaServerConfig] = {}
         self.base_port = 8080
-        self._server_ready = {}  # gpu_id -> bool
+        self._server_ready = {}
         
+    def get_server_port(self, gpu_id: int) -> Optional[int]:
+        """Obtiene el puerto de un servidor dado su gpu_id"""
+        config = self.configs.get(gpu_id)
+        return config.port if config else None
+    
+    def _verify_server_binary(self) -> bool:
+        """Verifica si el binario del servidor existe y es ejecutable"""
+        server_path = Path(self.server_binary)
+        if not server_path.exists():
+            logger.error(f"Binario del servidor no encontrado: {self.server_binary}")
+            logger.error("Sugerencias:")
+            logger.error("1. Clona llama.cpp: git clone https://github.com/ggerganov/llama.cpp.git")
+            logger.error("2. Compila: cd llama.cpp && make server LLAMA_CUDA=1")
+            logger.error("3. Copia server a la raíz del proyecto y hazlo ejecutable: chmod +x server")
+            return False
+        if not os.access(server_path, os.X_OK):
+            logger.error(f"Binario del servidor no es ejecutable: {self.server_binary}")
+            logger.error(f"Ejecuta: chmod +x {self.server_binary}")
+            return False
+        logger.info(f"✅ Binario del servidor verificado: {self.server_binary}")
+        return True
+    
+    def _check_port_available(self, port: int) -> bool:
+        """Verifica si el puerto está disponible"""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("0.0.0.0", port))
+                return True
+            except socket.error:
+                logger.error(f"Puerto {port} ya está en uso")
+                return False
+    
     async def start_server(self, config: LlamaServerConfig) -> bool:
         """Inicia un servidor llama.cpp en una GPU específica"""
         gpu_id = config.gpu_id
         
         if gpu_id in self.servers:
-            # Check if existing server is still alive
             process = self.servers[gpu_id]
             if process.poll() is None:
                 logger.warning(f"Servidor ya corriendo en GPU {gpu_id}")
                 return True
             else:
-                # Clean up dead process
                 logger.warning(f"Limpiando servidor muerto en GPU {gpu_id}")
                 del self.servers[gpu_id]
                 if gpu_id in self.configs:
@@ -345,23 +372,26 @@ class LlamaServerManager:
                 if gpu_id in self._server_ready:
                     del self._server_ready[gpu_id]
         
-        # Verify server binary exists and is executable
         if not self._verify_server_binary():
             return False
-            
-        # Configurar CUDA_VISIBLE_DEVICES
+        
+        # Verificar puerto
+        if not self._check_port_available(config.port):
+            logger.error(f"No se puede iniciar servidor en GPU {gpu_id}: puerto {config.port} ocupado")
+            return False
+        
         env = os.environ.copy()
         env['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
         
         cmd = [
             self.server_binary,
             "-m", str(config.model_path),
-            "--host", "0.0.0.0",  # Always bind to all interfaces
+            "--host", "0.0.0.0",
             "--port", str(config.port),
             "-c", str(config.context_size),
             "-np", str(config.parallel_requests),
             "-b", str(config.batch_size),
-            "-ngl", "-1",  # Todas las capas en GPU
+            "-ngl", "-1",
             "--threads", "8",
             "-v"
         ]
@@ -369,7 +399,6 @@ class LlamaServerManager:
         logger.info(f"Iniciando servidor GPU {gpu_id}: {' '.join(cmd)}")
         
         try:
-            # Create log files for debugging
             log_dir = Path("./logs")
             log_dir.mkdir(exist_ok=True)
             
@@ -388,15 +417,12 @@ class LlamaServerManager:
             self.configs[gpu_id] = config
             self._server_ready[gpu_id] = False
             
-            # Check if process started successfully
-            await asyncio.sleep(20)  # Give it plenty of time to start
+            await asyncio.sleep(3)
             
             if process.poll() is not None:
-                # Process has already exited
                 logger.error(f"Servidor GPU {gpu_id} falló al iniciar (exit code: {process.returncode})")
                 logger.error(f"Check logs: ./logs/llama_gpu_{gpu_id}_*.log")
                 
-                # Clean up
                 stdout_file.close()
                 stderr_file.close()
                 if gpu_id in self.servers:
@@ -408,7 +434,6 @@ class LlamaServerManager:
                     
                 return False
             
-            # Wait for server to be ready with more robust checking
             await self._wait_for_server_improved(config.port, gpu_id)
             self._server_ready[gpu_id] = True
             logger.info(f"✅ Servidor GPU {gpu_id} listo en puerto {config.port}")
@@ -416,11 +441,12 @@ class LlamaServerManager:
             
         except Exception as e:
             logger.error(f"Error iniciando servidor GPU {gpu_id}: {e}")
+            logger.error(f"Comando ejecutado: {' '.join(cmd)}")
+            logger.error(f"Check logs: ./logs/llama_gpu_{gpu_id}_*.log")
             
-            # Clean up if process was created
             if gpu_id in self.servers:
                 process = self.servers[gpu_id]
-                if process.poll() is None:  # Still running
+                if process.poll() is None:
                     process.terminate()
                     try:
                         process.wait(timeout=5)
@@ -434,6 +460,8 @@ class LlamaServerManager:
                 if gpu_id in self._server_ready:
                     del self._server_ready[gpu_id]
             
+            stdout_file.close()
+            stderr_file.close()
             return False
     
     def get_available_servers(self) -> List[int]:
@@ -447,7 +475,6 @@ class LlamaServerManager:
             elif process.poll() is not None:
                 dead_servers.append(gpu_id)
         
-        # Clean up dead servers
         for gpu_id in dead_servers:
             logger.warning(f"Servidor GPU {gpu_id} murió, removiendo")
             del self.servers[gpu_id]
@@ -458,12 +485,11 @@ class LlamaServerManager:
         
         return active_servers
     
-    async def _wait_for_server_improved(self, port: int, gpu_id: int, timeout: int = 300):  # Increased timeout to 300s
+    async def _wait_for_server_improved(self, port: int, gpu_id: int, timeout: int = 600):
         """Espera a que el servidor esté listo con mejor manejo de errores"""
         start_time = time.time()
         last_error = None
         
-        # Try different endpoints that llama.cpp server might expose
         test_endpoints = ["/health", "/v1/models", "/props", "/"]
         
         logger.info(f"Esperando servidor GPU {gpu_id} en puerto {port}...")
@@ -471,17 +497,15 @@ class LlamaServerManager:
         while time.time() - start_time < timeout:
             process = self.servers.get(gpu_id)
             if process and process.poll() is not None:
-                # Process has died
                 logger.error(f"Proceso del servidor GPU {gpu_id} murió durante inicialización (exit code: {process.returncode})")
                 logger.error(f"Check logs: ./logs/llama_gpu_{gpu_id}_*.log")
                 raise RuntimeError(f"Proceso del servidor GPU {gpu_id} falló")
             
-            # Try to connect to any of the endpoints
             for endpoint in test_endpoints:
                 try:
                     async with httpx.AsyncClient(timeout=5.0) as client:
-                        response = await client.get(f"http://127.0.0.1:{port}{endpoint}")  # Use 127.0.0.1 for internal checks
-                        if response.status_code in [200, 404, 405]:  # 405 Method Not Allowed is also OK
+                        response = await client.get(f"http://127.0.0.1:{port}{endpoint}")
+                        if response.status_code in [200, 404, 405]:
                             logger.info(f"✅ Servidor GPU {gpu_id} respondiendo en {endpoint} (status: {response.status_code})")
                             return
                         else:
@@ -494,7 +518,6 @@ class LlamaServerManager:
             logger.debug(f"Waiting for GPU {gpu_id} server... ({time.time() - start_time:.1f}s)")
             await asyncio.sleep(3)
         
-        # If we get here, timeout occurred
         logger.error(f"❌ Timeout esperando servidor GPU {gpu_id} en puerto {port}")
         logger.error(f"Último error: {last_error}")
         logger.error(f"Check logs: ./logs/llama_gpu_{gpu_id}_*.log")
@@ -509,7 +532,7 @@ class LlamaServerManager:
         """Detiene todos los servidores"""
         for gpu_id, process in self.servers.items():
             logger.info(f"Deteniendo servidor GPU {gpu_id}")
-            if process.poll() is None:  # Still running
+            if process.poll() is None:
                 process.terminate()
                 try:
                     process.wait(timeout=10)
@@ -520,6 +543,7 @@ class LlamaServerManager:
         
         self.servers.clear()
         self.configs.clear()
+        self._server_ready.clear()
 
 # ============================================================================
 # Load Balancer
@@ -531,8 +555,8 @@ class LoadBalancer:
     def __init__(self, server_manager: LlamaServerManager):
         self.server_manager = server_manager
         self.current_server = 0
-        self.server_stats = {}  # gpu_id -> {"requests": int, "avg_time": float}
-        self._last_health_check = {}  # gpu_id -> timestamp of last successful health check
+        self.server_stats = {}
+        self._last_health_check = {}
     
     async def _check_server_health(self, gpu_id: int) -> bool:
         """Verifica si un servidor específico está respondiendo"""
@@ -540,19 +564,17 @@ class LoadBalancer:
         if not port:
             return False
         
-        # Check cache first (avoid too frequent health checks)
         now = time.time()
         if gpu_id in self._last_health_check:
-            if now - self._last_health_check[gpu_id] < 5:  # Cache for 5 seconds
+            if now - self._last_health_check[gpu_id] < 5:
                 return True
         
         try:
             async with httpx.AsyncClient(timeout=2.0) as client:
-                # Try different endpoints that llama.cpp server exposes
                 for endpoint in ["/health", "/v1/models", "/props"]:
                     try:
-                        response = await client.get(f"http://127.0.0.1:{port}{endpoint}")  # Use 127.0.0.1
-                        if response.status_code in [200, 404]:  # 404 is OK, means server is up
+                        response = await client.get(f"http://127.0.0.1:{port}{endpoint}")
+                        if response.status_code in [200, 404]:
                             self._last_health_check[gpu_id] = now
                             return True
                     except:
@@ -564,14 +586,12 @@ class LoadBalancer:
     
     async def get_available_servers(self) -> List[int]:
         """Obtiene servidores que están realmente disponibles"""
-        # First get servers that have processes running
         running_servers = self.server_manager.get_available_servers()
         
         if not running_servers:
             logger.warning("No running server processes found")
             return []
         
-        # Then check which ones are actually responding
         available_servers = []
         health_checks = await asyncio.gather(
             *[self._check_server_health(gpu_id) for gpu_id in running_servers],
@@ -592,7 +612,6 @@ class LoadBalancer:
         
         if not available_servers:
             logger.error("No available servers found")
-            # Debug information
             running_servers = self.server_manager.get_available_servers()
             logger.error(f"Running processes: {running_servers}")
             for gpu_id in running_servers:
@@ -600,7 +619,6 @@ class LoadBalancer:
                 logger.error(f"GPU {gpu_id} -> Port {port}")
             return None
         
-        # Round-robin simple
         if self.current_server >= len(available_servers):
             self.current_server = 0
             
@@ -616,11 +634,9 @@ class LoadBalancer:
         if not available_servers:
             return None
         
-        # Si no hay estadísticas, usar round-robin
         if not any(server in self.server_stats for server in available_servers):
             return await self.get_next_server()
         
-        # Encontrar servidor con menor carga
         best_server = min(
             available_servers,
             key=lambda s: self.server_stats.get(s, {"requests": 0})["requests"]
@@ -636,7 +652,6 @@ class LoadBalancer:
         stats = self.server_stats[gpu_id]
         stats["requests"] += 1
         
-        # Media móvil del tiempo de procesamiento
         alpha = 0.1
         if stats["avg_time"] == 0:
             stats["avg_time"] = processing_time
@@ -650,14 +665,14 @@ class LoadBalancer:
 class LlamaClient:
     """Cliente para comunicarse con servidores llama.cpp"""
 
-    def __init__(self, load_balancer: LoadBalancer, host: str = "127.0.0.1"):  # Changed to 127.0.0.1
+    def __init__(self, load_balancer: LoadBalancer, host: str = "127.0.0.1"):
         self.load_balancer = load_balancer
         self.host = host
         self.session = None
     
     async def __aenter__(self):
         self.session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=300)  # 5 minutos timeout
+            timeout=aiohttp.ClientTimeout(total=300)
         )
         return self
     
@@ -667,10 +682,9 @@ class LlamaClient:
     
     async def generate_completion(self, request: CompletionRequest) -> Dict[str, Any]:
         """Genera una completion usando el mejor servidor disponible"""
-        gpu_id = await self.load_balancer.get_best_server()  # NOW ASYNC!
+        gpu_id = await self.load_balancer.get_best_server()
         
         if gpu_id is None:
-            # Better error reporting
             running_servers = self.load_balancer.server_manager.get_available_servers()
             available_servers = await self.load_balancer.get_available_servers()
             
@@ -711,10 +725,8 @@ class LlamaClient:
                 result = await response.json()
                 processing_time = time.time() - start_time
                 
-                # Actualizar estadísticas
                 self.load_balancer.update_server_stats(gpu_id, processing_time)
                 
-                # Agregar metadatos
                 result["gpu_id"] = gpu_id
                 result["processing_time"] = processing_time
                 
@@ -734,15 +746,14 @@ class EmbeddingManager:
     
     def __init__(self):
         self.models: Dict[str, SentenceTransformer] = {}
-        self.device = "cpu"  # Forzar CPU para embeddings
+        self.device = "cpu"
         
     async def load_model(self, model_name: str) -> SentenceTransformer:
         """Carga un modelo de embeddings"""
         if model_name not in self.models:
             logger.info(f"Cargando modelo de embeddings: {model_name}")
             
-            # Forzar CPU y configurar torch
-            torch.set_num_threads(4)  # Limitar threads para no interferir con GPUs
+            torch.set_num_threads(4)
             
             model = SentenceTransformer(model_name, device=self.device)
             self.models[model_name] = model
@@ -755,7 +766,6 @@ class EmbeddingManager:
         """Genera embeddings para un texto"""
         model = await self.load_model(model_name)
         
-        # Ejecutar en thread pool para no bloquear async
         loop = asyncio.get_event_loop()
         embedding = await loop.run_in_executor(
             None, 
@@ -768,7 +778,6 @@ class EmbeddingManager:
 # Aplicación FastAPI
 # ============================================================================
 
-# Variables globales
 gpu_manager = GPUManager()
 model_downloader = ModelDownloader()
 server_manager = LlamaServerManager()
@@ -780,15 +789,12 @@ async def lifespan(app: FastAPI):
     """Gestión del ciclo de vida de la aplicación"""
     logger.info("Iniciando sistema Multi-GPU Llama.cpp")
     
-    # Configuración pasada por argumentos (se inyecta desde main)
     args = app.state.args
     
     try:
-        # 1. Descargar modelo si es necesario
         logger.info(f"Descargando modelo: {args.repo_id}/{args.model_filename}")
         model_path = await model_downloader.download_model(args.repo_id, args.model_filename)
         
-        # 2. Detectar GPUs disponibles
         gpu_manager.refresh_gpu_info()
         available_gpus = gpu_manager.get_available_gpus(args.min_vram_gb)
         
@@ -798,12 +804,12 @@ async def lifespan(app: FastAPI):
         
         logger.info(f"GPUs disponibles: {available_gpus}")
         
-        # 3. Iniciar servidores en cada GPU
         tasks = []
         for i, gpu_id in enumerate(available_gpus[:args.max_gpus]):
+            port = 8080 + i  # Use index to avoid port conflicts
             config = LlamaServerConfig(
                 gpu_id=gpu_id,
-                port=8080 + gpu_id,
+                port=port,
                 model_path=model_path,
                 context_size=args.context_size,
                 parallel_requests=args.parallel_requests,
@@ -814,17 +820,18 @@ async def lifespan(app: FastAPI):
             task = server_manager.start_server(config)
             tasks.append(task)
         
-        # Esperar a que todos los servidores estén listos
         results = await asyncio.gather(*tasks, return_exceptions=True)
         successful_servers = sum(1 for r in results if r is True)
         
         if successful_servers == 0:
             logger.error("No se pudo iniciar ningún servidor")
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.error(f"Error iniciando servidor GPU {available_gpus[i]}: {result}")
             sys.exit(1)
         
         logger.info(f"✅ {successful_servers} servidores iniciados correctamente")
         
-        # 4. Precargar modelo de embeddings
         logger.info(f"Precargando modelo de embeddings: {args.embedding_model}")
         await embedding_manager.load_model(args.embedding_model)
         
@@ -837,7 +844,6 @@ async def lifespan(app: FastAPI):
         server_manager.stop_all_servers()
         logger.info("Sistema detenido correctamente")
 
-# Crear app FastAPI
 app = FastAPI(
     title="Multi-GPU Llama.cpp API",
     description="API distribuida para inferencia con Llama.cpp en múltiples GPUs",
@@ -870,8 +876,7 @@ async def create_completion(request: CompletionRequest):
             media_type="text/event-stream"
         )
     
-    # Use localhost for internal communication (more reliable than 0.0.0.0)
-    async with LlamaClient(load_balancer, host="127.0.0.1") as client:  # Updated host
+    async with LlamaClient(load_balancer, host="127.0.0.1") as client:
         result = await client.generate_completion(request)
         
         return CompletionResponse(
@@ -897,14 +902,18 @@ async def create_completion(request: CompletionRequest):
 async def stream_completion(request: CompletionRequest):
     """Stream de completion"""
     async with LlamaClient(load_balancer) as client:
-        async for chunk in client.generate_completion_stream(request):
-            yield chunk
+        try:
+            async for chunk in client.generate_completion_stream(request):
+                yield chunk
+        except AttributeError:
+            # Fallback si generate_completion_stream no está implementado
+            result = await client.generate_completion(request)
+            yield f"data: {json.dumps(result)}\n\n"
         yield "data: [DONE]\n\n"
 
 @app.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest):
     """Genera respuesta de chat"""
-    # Convertir mensajes a prompt
     prompt = messages_to_prompt(request.messages)
     
     completion_request = CompletionRequest(
@@ -1037,7 +1046,6 @@ def parse_arguments():
         description="Sistema Multi-GPU Llama.cpp con FastAPI"
     )
     
-    # Configuración del modelo
     parser.add_argument(
         "--repo-id",
         default="unsloth/Qwen2.5-Coder-32B-Instruct-GGUF",
@@ -1048,8 +1056,6 @@ def parse_arguments():
         default="Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf",
         help="Nombre del archivo del modelo GGUF"
     )
-    
-    # Configuración del servidor
     parser.add_argument(
         "--server-binary",
         default="./server",
@@ -1079,8 +1085,6 @@ def parse_arguments():
         default=512,
         help="Tamaño del batch"
     )
-    
-    # Configuración de GPUs
     parser.add_argument(
         "--max-gpus",
         type=int,
@@ -1098,8 +1102,6 @@ def parse_arguments():
         type=str,
         help="IDs específicos de GPUs a usar (ej: 0,1,2)"
     )
-    
-    # Configuración de embeddings
     parser.add_argument(
         "--embedding-model",
         default="all-MiniLM-L6-v2",
@@ -1111,8 +1113,6 @@ def parse_arguments():
         default=4,
         help="Threads para embeddings en CPU"
     )
-    
-    # Configuración de la API
     parser.add_argument(
         "--host",
         default="0.0.0.0",
@@ -1130,8 +1130,6 @@ def parse_arguments():
         default=1,
         help="Workers de Uvicorn"
     )
-    
-    # Configuración de logging
     parser.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -1142,8 +1140,6 @@ def parse_arguments():
         "--log-file",
         help="Archivo de log (opcional)"
     )
-    
-    # Configuración de descarga
     parser.add_argument(
         "--models-dir",
         default="./models",
@@ -1187,13 +1183,12 @@ async def validate_environment(args):
     errors = []
     warnings = []
     
-    # Verificar binario del servidor
     server_path = Path(args.server_binary)
     if not server_path.exists():
         errors.append(f"Binario del servidor no encontrado: {args.server_binary}")
         logger.error("Sugerencias para resolver problema del servidor:")
         logger.error("1. Clona llama.cpp: git clone https://github.com/ggerganov/llama.cpp.git")
-        logger.error("2. Compila: cd llama.cpp && make server")
+        logger.error("2. Compila: cd llama.cpp && make server LLAMA_CUDA=1")
         logger.error("3. Usa --server-binary para especificar ruta correcta")
     elif not os.access(server_path, os.X_OK):
         errors.append(f"Binario del servidor no es ejecutable: {args.server_binary}")
@@ -1201,7 +1196,6 @@ async def validate_environment(args):
     else:
         logger.info(f"✅ Binario del servidor encontrado: {args.server_binary}")
     
-    # Verificar nvidia-smi (no crítico)
     try:
         result = subprocess.run(["nvidia-smi"], capture_output=True, check=True, timeout=10)
         logger.info("✅ nvidia-smi disponible")
@@ -1210,7 +1204,6 @@ async def validate_environment(args):
     except (subprocess.CalledProcessError, FileNotFoundError):
         warnings.append("nvidia-smi no disponible - usando detección CUDA alternativa")
     
-    # Verificar CUDA con PyTorch
     cuda_available = False
     try:
         import torch
@@ -1219,17 +1212,15 @@ async def validate_environment(args):
             gpu_count = torch.cuda.device_count()
             logger.info(f"✅ CUDA disponible - {gpu_count} GPU(s) detectadas")
             
-            # Log GPU details
             for i in range(gpu_count):
                 props = torch.cuda.get_device_properties(i)
                 memory_gb = props.total_memory / (1024**3)
                 logger.info(f"   GPU {i}: {props.name} - {memory_gb:.1f}GB VRAM")
         else:
-            errors.append("CUDA no está disponible en PyTorch")
+            warnings.append("CUDA no está disponible en PyTorch")
     except ImportError:
-        errors.append("PyTorch no instalado (requerido para detección CUDA y embeddings)")
+        warnings.append("PyTorch no instalado (requerido para detección CUDA y embeddings)")
     
-    # Verificar GPUs disponibles usando nuestro manager
     gpu_manager.refresh_gpu_info()
     available_gpus = gpu_manager.get_available_gpus(args.min_vram_gb)
     
@@ -1241,12 +1232,10 @@ async def validate_environment(args):
     else:
         logger.info(f"✅ {len(available_gpus)} GPU(s) disponibles con suficiente VRAM")
     
-    # Verificar sentence-transformers
     try:
         from sentence_transformers import SentenceTransformer
         logger.info("✅ sentence-transformers disponible")
         
-        # Test load a small model to verify it works
         try:
             test_model = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
             logger.info("✅ Embeddings funcionando correctamente")
@@ -1256,7 +1245,6 @@ async def validate_environment(args):
     except ImportError:
         errors.append("sentence-transformers no instalado (pip install sentence-transformers)")
     
-    # Verificar otras dependencias críticas
     required_modules = [
         ('aiohttp', 'aiohttp'),
         ('aiofiles', 'aiofiles'), 
@@ -1278,12 +1266,10 @@ async def validate_environment(args):
         errors.append(f"Módulos faltantes: {', '.join(missing_modules)}")
         logger.error(f"Instala con: pip install {' '.join(missing_modules)}")
     
-    # Verificar espacio en disco para modelos
     try:
         models_path = Path(args.models_dir)
         models_path.mkdir(exist_ok=True)
         
-        # Check available space (rough estimate - 50GB should be enough for most models)
         statvfs = os.statvfs(models_path)
         free_space_gb = (statvfs.f_frsize * statvfs.f_bavail) / (1024**3)
         
@@ -1295,7 +1281,6 @@ async def validate_environment(args):
     except Exception as e:
         warnings.append(f"No se pudo verificar espacio en disco: {e}")
     
-    # Verificar conectividad a Hugging Face (no crítico)
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.get("https://huggingface.co")
@@ -1306,14 +1291,12 @@ async def validate_environment(args):
     except Exception:
         warnings.append("No se pudo verificar conectividad a Hugging Face")
     
-    # Mostrar warnings
     if warnings:
         logger.warning("⚠️  Advertencias de configuración:")
         for warning in warnings:
             logger.warning(f"  - {warning}")
         logger.warning("El sistema puede funcionar con limitaciones")
     
-    # Mostrar errores
     if errors:
         logger.error("❌ Errores de configuración críticos:")
         for error in errors:
@@ -1339,7 +1322,6 @@ def print_startup_info(args):
     print(f"🌐 API: http://{args.host}:{args.port}")
     print("="*80)
     
-    # Mostrar GPUs detectadas
     gpu_manager.refresh_gpu_info()
     available_gpus = gpu_manager.get_available_gpus(args.min_vram_gb)
     
@@ -1379,7 +1361,6 @@ class HealthCheckServer:
             
             metrics = []
             
-            # Métricas de GPU
             for gpu in gpu_manager.gpus:
                 metrics.extend([
                     f'gpu_memory_total_bytes{{gpu="{gpu.id}",name="{gpu.name}"}} {gpu.memory_total * 1024 * 1024}',
@@ -1388,7 +1369,6 @@ class HealthCheckServer:
                     f'gpu_temperature_celsius{{gpu="{gpu.id}",name="{gpu.name}"}} {gpu.temperature}'
                 ])
             
-            # Métricas de servidores
             for gpu_id in server_manager.get_available_servers():
                 stats = load_balancer.server_stats.get(gpu_id, {})
                 requests = stats.get("requests", 0)
@@ -1403,10 +1383,8 @@ class HealthCheckServer:
 
 def detect_environment():
     """Detect if running in RunPod or similar container environment"""
-    # Check for RunPod-specific environment variables
     if os.environ.get('RUNPOD_POD_ID'):
         return 'runpod'
-    # Check for common container indicators
     elif os.path.exists('/.dockerenv'):
         return 'container'
     else:
@@ -1420,46 +1398,29 @@ async def main():
     logger.info(f"Detected environment: {env_type}")
     
     if env_type == 'runpod':
-        # RunPod-specific configurations
-        args.host = "0.0.0.0"  # Ensure binding to all interfaces
-        
-        # RunPod typically exposes port 3000 by default
+        args.host = "0.0.0.0"
         if args.port == 3000:
             logger.info("Using RunPod default port 3000")
-        
-        # Disable separate health check server in RunPod
-        # as it can cause port conflicts
-        logger.info("RunPod environment detected - disabling separate health server")
         run_health_server = False
     else:
         run_health_server = True
     
-    # Configurar logging
     setup_logging(args)
-    
-    # Configurar manejadores de señales
     setup_signal_handlers()
-    
-    # Mostrar información de inicio
     print_startup_info(args)
     
-    # Validar entorno
     if not await validate_environment(args):
         sys.exit(1)
     
-    # Configurar directorio de modelos
     global model_downloader
     model_downloader = ModelDownloader(args.models_dir)
     
-    # Configurar servidor llama.cpp
     global server_manager
     server_manager = LlamaServerManager(args.server_binary)
     
-    # Configurar manager de embeddings
     global embedding_manager
     embedding_manager = EmbeddingManager()
     
-    # Filtrar GPUs específicas si se especificaron
     if args.gpu_ids:
         specified_gpus = [int(x.strip()) for x in args.gpu_ids.split(",")]
         available_gpus = gpu_manager.get_available_gpus(args.min_vram_gb)
@@ -1471,13 +1432,10 @@ async def main():
         
         logger.info(f"Usando GPUs específicas: {available_gpus}")
     
-    # CRITICAL FIX: Inject args into app state BEFORE starting the server
     app.state.args = args
     
-    # Start servers conditionally
     try:
         if run_health_server:
-            # Start separate health server for local development
             health_server = HealthCheckServer()
             health_config = uvicorn.Config(
                 health_server.app,
@@ -1488,7 +1446,6 @@ async def main():
             )
             health_server_instance = uvicorn.Server(health_config)
         
-        # Main server configuration
         config = uvicorn.Config(
             app,
             host=args.host,
@@ -1506,7 +1463,6 @@ async def main():
                 tg.create_task(health_server_instance.serve())
                 tg.create_task(server.serve())
         else:
-            # RunPod: only run main server
             await server.serve()
             
     except Exception as e:
