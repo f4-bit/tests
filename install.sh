@@ -9,32 +9,58 @@ echo "================================================"
 echo "🔍 Verificando dependencias del sistema..."
 
 # Verificar cmake
+#!/bin/bash
+
+# Verificar cmake
 if ! command -v cmake &> /dev/null; then
-    echo "❌ CMake no encontrado. Instalando..."
+    echo "❌ CMake no encontrado. Instalando sin sudo..."
     
-    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-        # Linux
-        if command -v apt &> /dev/null; then
-            sudo apt update && sudo apt install -y cmake build-essential
-        elif command -v yum &> /dev/null; then
-            sudo yum install -y cmake gcc-c++ make
-        elif command -v dnf &> /dev/null; then
-            sudo dnf install -y cmake gcc-c++ make
-        else
-            echo "❌ No se pudo instalar CMake automáticamente. Instálalo manualmente."
-            exit 1
-        fi
-    elif [[ "$OSTYPE" == "darwin"* ]]; then
-        # macOS
-        if command -v brew &> /dev/null; then
-            brew install cmake
-        else
-            echo "❌ Instala CMake manualmente: brew install cmake"
-            exit 1
-        fi
+    # Crear directorio local para binarios si no existe
+    mkdir -p ~/bin
+    mkdir -p ~/local
+    
+    # Método 1: Descargar binario precompilado de CMake
+    echo "📥 Descargando CMake precompilado..."
+    cd ~/local
+    
+    # Obtener la última versión estable (ajustar según necesidad)
+    CMAKE_VERSION="3.27.7"
+    CMAKE_ARCHIVE="cmake-${CMAKE_VERSION}-linux-x86_64"
+    
+    # Descargar si no existe
+    if [ ! -f "${CMAKE_ARCHIVE}.tar.gz" ]; then
+        wget "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_ARCHIVE}.tar.gz"
     fi
+    
+    # Extraer
+    if [ ! -d "$CMAKE_ARCHIVE" ]; then
+        tar -xzf "${CMAKE_ARCHIVE}.tar.gz"
+    fi
+    
+    # Crear enlace simbólico en ~/bin
+    ln -sf ~/local/${CMAKE_ARCHIVE}/bin/cmake ~/bin/cmake
+    ln -sf ~/local/${CMAKE_ARCHIVE}/bin/ctest ~/bin/ctest
+    ln -sf ~/local/${CMAKE_ARCHIVE}/bin/cpack ~/bin/cpack
+    
+    # Agregar ~/bin al PATH si no está
+    if [[ ":$PATH:" != *":$HOME/bin:"* ]]; then
+        echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc
+        export PATH="$HOME/bin:$PATH"
+    fi
+    
+    echo "✅ CMake instalado en ~/bin/"
+    echo "🔄 Ejecuta 'source ~/.bashrc' o reinicia la terminal"
+    
 else
     echo "✅ CMake encontrado: $(cmake --version | head -n1)"
+fi
+
+# Verificar instalación
+if command -v cmake &> /dev/null; then
+    echo "✅ CMake está disponible: $(which cmake)"
+    echo "📋 Versión: $(cmake --version | head -n1)"
+else
+    echo "⚠️  CMake instalado pero no en PATH. Ejecuta: source ~/.bashrc"
 fi
 
 # Verificar compilador C++
