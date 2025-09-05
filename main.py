@@ -458,7 +458,7 @@ class LlamaServerManager:
         
         return active_servers
     
-    async def _wait_for_server_improved(self, port: int, gpu_id: int, timeout: int = 120):
+    async def _wait_for_server_improved(self, port: int, gpu_id: int, timeout: int = 300):  # Increased timeout to 300s
         """Espera a que el servidor esté listo con mejor manejo de errores"""
         start_time = time.time()
         last_error = None
@@ -480,7 +480,7 @@ class LlamaServerManager:
             for endpoint in test_endpoints:
                 try:
                     async with httpx.AsyncClient(timeout=5.0) as client:
-                        response = await client.get(f"http://localhost:{port}{endpoint}")
+                        response = await client.get(f"http://127.0.0.1:{port}{endpoint}")  # Use 127.0.0.1 for internal checks
                         if response.status_code in [200, 404, 405]:  # 405 Method Not Allowed is also OK
                             logger.info(f"✅ Servidor GPU {gpu_id} respondiendo en {endpoint} (status: {response.status_code})")
                             return
@@ -551,7 +551,7 @@ class LoadBalancer:
                 # Try different endpoints that llama.cpp server exposes
                 for endpoint in ["/health", "/v1/models", "/props"]:
                     try:
-                        response = await client.get(f"http://localhost:{port}{endpoint}")
+                        response = await client.get(f"http://127.0.0.1:{port}{endpoint}")  # Use 127.0.0.1
                         if response.status_code in [200, 404]:  # 404 is OK, means server is up
                             self._last_health_check[gpu_id] = now
                             return True
@@ -650,7 +650,7 @@ class LoadBalancer:
 class LlamaClient:
     """Cliente para comunicarse con servidores llama.cpp"""
 
-    def __init__(self, load_balancer: LoadBalancer, host: str = "localhost"):
+    def __init__(self, load_balancer: LoadBalancer, host: str = "127.0.0.1"):  # Changed to 127.0.0.1
         self.load_balancer = load_balancer
         self.host = host
         self.session = None
@@ -871,7 +871,7 @@ async def create_completion(request: CompletionRequest):
         )
     
     # Use localhost for internal communication (more reliable than 0.0.0.0)
-    async with LlamaClient(load_balancer, host="localhost") as client:
+    async with LlamaClient(load_balancer, host="127.0.0.1") as client:  # Updated host
         result = await client.generate_completion(request)
         
         return CompletionResponse(
@@ -1471,14 +1471,8 @@ async def main():
         
         logger.info(f"Usando GPUs específicas: {available_gpus}")
     
-    global llama_client_host
-    llama_client_host = "localhost" if env_type == 'local' else "0.0.0.0"
-    
     # CRITICAL FIX: Inject args into app state BEFORE starting the server
     app.state.args = args
-    
-    # Also set client_host for LlamaClient
-    app.state.client_host = llama_client_host
     
     # Start servers conditionally
     try:
