@@ -504,6 +504,22 @@ class LlamaServerManager:
             logger.error(f"Process exit code: {process.returncode}")
         
         raise TimeoutError(f"Servidor en puerto {port} no respondió en {timeout}s")
+    
+    def stop_all_servers(self):
+        """Detiene todos los servidores"""
+        for gpu_id, process in self.servers.items():
+            logger.info(f"Deteniendo servidor GPU {gpu_id}")
+            if process.poll() is None:  # Still running
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    logger.warning(f"Forzando terminación del servidor GPU {gpu_id}")
+                    process.kill()
+                    process.wait()
+        
+        self.servers.clear()
+        self.configs.clear()
 
 # ============================================================================
 # Load Balancer
