@@ -326,13 +326,13 @@ class LlamaServerManager:
             return False
     
     async def _wait_for_server(self, port: int, timeout: int = 60):
-        """Espera a que un servidor esté disponible"""
         start_time = time.time()
         
         while time.time() - start_time < timeout:
             try:
                 async with httpx.AsyncClient() as client:
-                    response = await client.get(f"http://0.0.0.0:{port}/health", timeout=2)
+                    # Use localhost for internal health checks, but servers bind to 0.0.0.0
+                    response = await client.get(f"http://localhost:{port}/health", timeout=2)
                     if response.status_code == 200:
                         return
             except:
@@ -432,9 +432,10 @@ class LoadBalancer:
 
 class LlamaClient:
     """Cliente para comunicarse con servidores llama.cpp"""
-    
-    def __init__(self, load_balancer: LoadBalancer):
+
+    def __init__(self, load_balancer: LoadBalancer, host: str = "0.0.0.0"):
         self.load_balancer = load_balancer
+        self.host = host  # Allow configurable host
         self.session = None
     
     async def __aenter__(self):
@@ -454,7 +455,7 @@ class LlamaClient:
             raise HTTPException(status_code=503, detail="No hay servidores disponibles")
         
         port = self.load_balancer.server_manager.get_server_port(gpu_id)
-        url = f"http://127.0.0.1:{port}/completion"
+        url = f"http://{self.host}:{port}/completion"
         
         payload = {
             "prompt": request.prompt,
@@ -681,14 +682,15 @@ async def health_check():
 
 @app.post("/v1/completions", response_model=CompletionResponse)
 async def create_completion(request: CompletionRequest):
-    """Genera una completion de texto"""
     if request.stream:
         return StreamingResponse(
             stream_completion(request),
             media_type="text/event-stream"
         )
     
-    async with LlamaClient(load_balancer) as client:
+    # Use environment-appropriate host
+    client_host = getattr(app.state, 'client_host', 'localhost')
+    async with LlamaClient(load_balancer, host=client_host) as client:
         result = await client.generate_completion(request)
         
         return CompletionResponse(
@@ -1044,7 +1046,6 @@ def print_startup_info(args):
     
     print("="*80 + "\n")
 
-'''
 class HealthCheckServer:
     """Servidor de health check independiente para monitoreo"""
     
@@ -1091,10 +1092,39 @@ class HealthCheckServer:
                 ])
             
             return "\n".join(metrics)
-'''
+
+def detect_environment():
+    """Detect if running in RunPod or similar container environment"""
+    # Check for RunPod-specific environment variables
+    if os.environ.get('RUNPOD_POD_ID'):
+        return 'runpod'
+    # Check for common container indicators
+    elif os.path.exists('/.dockerenv'):
+        return 'container'
+    else:
+        return 'local'
+
 async def main():
     """Función principal"""
     args = parse_arguments()
+
+    env_type = detect_environment()
+    logger.info(f"Detected environment: {env_type}")
+    
+    if env_type == 'runpod':
+        # RunPod-specific configurations
+        args.host = "0.0.0.0"  # Ensure binding to all interfaces
+        
+        # RunPod typically exposes port 3000 by default
+        if args.port == 3000:
+            logger.info("Using RunPod default port 3000")
+        
+        # Disable separate health check server in RunPod
+        # as it can cause port conflicts
+        logger.info("RunPod environment detected - disabling separate health server")
+        run_health_server = False
+    else:
+        run_health_server = True
     
     # Configurar logging
     setup_logging(args)
@@ -1133,44 +1163,44 @@ async def main():
         
         logger.info(f"Usando GPUs específicas: {available_gpus}")
     
-    # Inyectar args en el estado de la app para el lifespan
-    app.state.args = args
+    global llama_client_host
+    llama_client_host = "localhost" if env_type == 'local' else "0.0.0.0"
     
-    '''
-    # Iniciar servidor de health check independiente
-    health_server = HealthCheckServer()
-    health_config = uvicorn.Config(
-        health_server.app,
-        host=args.host,
-        port=8080,  # Puerto diferente para health check
-        log_level=args.log_level.lower(),
-        access_log=False
-    )
-    health_server_instance = uvicorn.Server(health_config)
-    '''
-    # Configurar servidor principal
-    config = uvicorn.Config(
-        app,
-        host=args.host,
-        port=args.port,
-        workers=args.workers,
-        log_level=args.log_level.lower(),
-        access_log=True,
-        reload=False  # No reload en producción
-    )
-    
-    server = uvicorn.Server(config)
-    
+    # Start servers conditionally
     try:
-        # Iniciar ambos servidores
-        logger.info("Iniciando servidores...")
+        if run_health_server:
+            # Start separate health server for local development
+            health_server = HealthCheckServer()
+            health_config = uvicorn.Config(
+                health_server.app,
+                host=args.host,
+                port=8080,
+                log_level=args.log_level.lower(),
+                access_log=False
+            )
+            health_server_instance = uvicorn.Server(health_config)
         
-        async with asyncio.TaskGroup() as tg:
-            #tg.create_task(health_server_instance.serve())
-            tg.create_task(server.serve())
+        # Main server configuration
+        config = uvicorn.Config(
+            app,
+            host=args.host,
+            port=args.port,
+            workers=args.workers,
+            log_level=args.log_level.lower(),
+            access_log=True,
+            reload=False
+        )
+        
+        server = uvicorn.Server(config)
+        
+        if run_health_server:
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(health_server_instance.serve())
+                tg.create_task(server.serve())
+        else:
+            # RunPod: only run main server
+            await server.serve()
             
-    except KeyboardInterrupt:
-        logger.info("Deteniendo por solicitud del usuario")
     except Exception as e:
         logger.error(f"Error crítico: {e}")
         sys.exit(1)
