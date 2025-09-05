@@ -389,7 +389,7 @@ class LlamaServerManager:
             self._server_ready[gpu_id] = False
             
             # Check if process started successfully
-            await asyncio.sleep(3)  # Give it more time to start
+            await asyncio.sleep(20)  # Give it plenty of time to start
             
             if process.poll() is not None:
                 # Process has already exited
