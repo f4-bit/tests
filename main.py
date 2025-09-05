@@ -1166,6 +1166,12 @@ async def main():
     global llama_client_host
     llama_client_host = "localhost" if env_type == 'local' else "0.0.0.0"
     
+    # CRITICAL FIX: Inject args into app state BEFORE starting the server
+    app.state.args = args
+    
+    # Also set client_host for LlamaClient
+    app.state.client_host = llama_client_host
+    
     # Start servers conditionally
     try:
         if run_health_server:
