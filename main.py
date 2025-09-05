@@ -613,8 +613,9 @@ class LlamaClient:
     async def generate_completion(self, request: CompletionRequest) -> Dict[str, Any]:
         """Genera una completion usando el mejor servidor disponible"""
         gpu_id = self.load_balancer.get_best_server()
-        if gpu_id is None:
-            raise HTTPException(status_code=503, detail="No hay servidores disponibles")
+
+        #if gpu_id is None:
+        #    raise HTTPException(status_code=503, detail="No hay servidores disponibles")
         
         port = self.load_balancer.server_manager.get_server_port(gpu_id)
         url = f"http://{self.host}:{port}/completion"
