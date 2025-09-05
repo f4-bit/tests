@@ -999,7 +999,7 @@ def print_startup_info(args):
 class HealthCheckServer:
     """Servidor de health check independiente para monitoreo"""
     
-    def __init__(self, port: int = 3001):
+    def __init__(self, port: int = 8080):
         self.port = port
         self.app = FastAPI(title="Health Check")
         self.setup_routes()
@@ -1092,7 +1092,7 @@ async def main():
     health_config = uvicorn.Config(
         health_server.app,
         host=args.host,
-        port=3001,
+        port=8080,
         log_level=args.log_level.lower(),
         access_log=False
     )
