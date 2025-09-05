@@ -9,7 +9,7 @@ from huggingface_hub import hf_hub_download
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 model_path = hf_hub_download(
-    repo_id="Qwen/Qwen2.5-Coder-32B-Instruct",
+    repo_id="Qwen/Qwen2.5-Coder-32B-Instruct-GGUF",
     filename="Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf",
     repo_type="model"
 )
