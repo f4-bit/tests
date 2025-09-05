@@ -324,14 +324,26 @@ class LlamaServerManager:
         self.servers: Dict[int, subprocess.Popen] = {}  # gpu_id -> process
         self.configs: Dict[int, LlamaServerConfig] = {}
         self.base_port = 8080
+        self._server_ready = {}  # gpu_id -> bool
         
     async def start_server(self, config: LlamaServerConfig) -> bool:
         """Inicia un servidor llama.cpp en una GPU específica"""
         gpu_id = config.gpu_id
         
         if gpu_id in self.servers:
-            logger.warning(f"Servidor ya corriendo en GPU {gpu_id}")
-            return True
+            # Check if existing server is still alive
+            process = self.servers[gpu_id]
+            if process.poll() is None:
+                logger.warning(f"Servidor ya corriendo en GPU {gpu_id}")
+                return True
+            else:
+                # Clean up dead process
+                logger.warning(f"Limpiando servidor muerto en GPU {gpu_id}")
+                del self.servers[gpu_id]
+                if gpu_id in self.configs:
+                    del self.configs[gpu_id]
+                if gpu_id in self._server_ready:
+                    del self._server_ready[gpu_id]
         
         # Verify server binary exists and is executable
         if not self._verify_server_binary():
@@ -344,52 +356,62 @@ class LlamaServerManager:
         cmd = [
             self.server_binary,
             "-m", str(config.model_path),
-            "--host", "0.0.0.0",
+            "--host", "0.0.0.0",  # Always bind to all interfaces
             "--port", str(config.port),
             "-c", str(config.context_size),
             "-np", str(config.parallel_requests),
             "-b", str(config.batch_size),
             "-ngl", "-1",  # Todas las capas en GPU
             "--threads", "8",
-            #"--log-format", "json",
             "-v"
         ]
         
         logger.info(f"Iniciando servidor GPU {gpu_id}: {' '.join(cmd)}")
         
         try:
+            # Create log files for debugging
+            log_dir = Path("./logs")
+            log_dir.mkdir(exist_ok=True)
+            
+            stdout_file = open(log_dir / f"llama_gpu_{gpu_id}_stdout.log", "w")
+            stderr_file = open(log_dir / f"llama_gpu_{gpu_id}_stderr.log", "w")
+            
             process = subprocess.Popen(
                 cmd,
                 env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=stdout_file,
+                stderr=stderr_file,
                 text=True
             )
             
             self.servers[gpu_id] = process
             self.configs[gpu_id] = config
+            self._server_ready[gpu_id] = False
             
             # Check if process started successfully
-            await asyncio.sleep(2)  # Give it a moment to start
+            await asyncio.sleep(3)  # Give it more time to start
             
             if process.poll() is not None:
                 # Process has already exited
-                stdout, stderr = process.communicate()
-                logger.error(f"Servidor GPU {gpu_id} falló al iniciar:")
-                logger.error(f"STDOUT: {stdout}")
-                logger.error(f"STDERR: {stderr}")
+                logger.error(f"Servidor GPU {gpu_id} falló al iniciar (exit code: {process.returncode})")
+                logger.error(f"Check logs: ./logs/llama_gpu_{gpu_id}_*.log")
                 
                 # Clean up
+                stdout_file.close()
+                stderr_file.close()
                 if gpu_id in self.servers:
                     del self.servers[gpu_id]
                 if gpu_id in self.configs:
                     del self.configs[gpu_id]
+                if gpu_id in self._server_ready:
+                    del self._server_ready[gpu_id]
                     
                 return False
             
             # Wait for server to be ready with more robust checking
             await self._wait_for_server_improved(config.port, gpu_id)
-            logger.info(f"Servidor GPU {gpu_id} listo en puerto {config.port}")
+            self._server_ready[gpu_id] = True
+            logger.info(f"✅ Servidor GPU {gpu_id} listo en puerto {config.port}")
             return True
             
         except Exception as e:
@@ -409,107 +431,20 @@ class LlamaServerManager:
                 del self.servers[gpu_id]
                 if gpu_id in self.configs:
                     del self.configs[gpu_id]
+                if gpu_id in self._server_ready:
+                    del self._server_ready[gpu_id]
             
             return False
-    
-    def _verify_server_binary(self) -> bool:
-        """Verifica que el binario del servidor existe y es ejecutable"""
-        binary_path = Path(self.server_binary)
-        
-        if not binary_path.exists():
-            logger.error(f"Binario del servidor no encontrado: {self.server_binary}")
-            logger.info("Sugerencias:")
-            logger.info("1. Compila llama.cpp: cmake --build . --target server")
-            logger.info("2. Verifica la ruta del binario")
-            logger.info("3. Usa --server-binary para especificar ruta correcta")
-            return False
-        
-        if not os.access(binary_path, os.X_OK):
-            logger.error(f"Binario del servidor no es ejecutable: {self.server_binary}")
-            logger.info(f"Ejecuta: chmod +x {self.server_binary}")
-            return False
-        
-        return True
-    
-    async def _wait_for_server_improved(self, port: int, gpu_id: int, timeout: int = 90):
-        """Espera a que el servidor esté listo con mejor manejo de errores"""
-        start_time = time.time()
-        last_error = None
-        
-        # Try different endpoints that llama.cpp server might expose
-        test_endpoints = [
-            "/health",
-            "/v1/models", 
-            "/props",
-            "/",
-        ]
-        
-        while time.time() - start_time < timeout:
-            process = self.servers.get(gpu_id)
-            if process and process.poll() is not None:
-                # Process has died
-                stdout, stderr = process.communicate()
-                logger.error(f"Proceso del servidor GPU {gpu_id} murió durante inicialización:")
-                logger.error(f"STDOUT: {stdout[-1000:]}")  # Last 1000 chars
-                logger.error(f"STDERR: {stderr[-1000:]}")
-                raise RuntimeError(f"Proceso del servidor GPU {gpu_id} falló")
-            
-            # Try to connect to any of the endpoints
-            for endpoint in test_endpoints:
-                try:
-                    async with httpx.AsyncClient(timeout=3.0) as client:
-                        response = await client.get(f"http://localhost:{port}{endpoint}")
-                        if response.status_code in [200, 404]:  # 404 is OK too, means server is responding
-                            logger.info(f"Servidor GPU {gpu_id} respondiendo en {endpoint}")
-                            return
-                except Exception as e:
-                    last_error = e
-                    continue
-            
-            await asyncio.sleep(2)
-        
-        # If we get here, timeout occurred
-        process = self.servers.get(gpu_id)
-        if process:
-            stdout, stderr = process.communicate() if process.poll() is not None else ("", "")
-            logger.error(f"Timeout esperando servidor GPU {gpu_id}. Último error: {last_error}")
-            if stdout:
-                logger.error(f"STDOUT: {stdout[-1000:]}")
-            if stderr:
-                logger.error(f"STDERR: {stderr[-1000:]}")
-        
-        raise TimeoutError(f"Servidor en puerto {port} no respondió en {timeout}s")
-    
-    async def _wait_for_server(self, port: int, timeout: int = 60):
-        """Método original mantenido por compatibilidad"""
-        await self._wait_for_server_improved(port, 0, timeout)
-    
-    def stop_all_servers(self):
-        """Detiene todos los servidores"""
-        for gpu_id, process in self.servers.items():
-            logger.info(f"Deteniendo servidor GPU {gpu_id}")
-            if process.poll() is None:  # Still running
-                process.terminate()
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    logger.warning(f"Forzando terminación del servidor GPU {gpu_id}")
-                    process.kill()
-                    process.wait()
-        
-        self.servers.clear()
-        self.configs.clear()
     
     def get_available_servers(self) -> List[int]:
-        """Obtiene lista de servidores disponibles"""
-        # Filter out dead processes
+        """Obtiene lista de servidores con procesos vivos y marcados como listos"""
         active_servers = []
         dead_servers = []
         
         for gpu_id, process in self.servers.items():
-            if process.poll() is None:  # Still running
+            if process.poll() is None and self._server_ready.get(gpu_id, False):
                 active_servers.append(gpu_id)
-            else:
+            elif process.poll() is not None:
                 dead_servers.append(gpu_id)
         
         # Clean up dead servers
@@ -518,13 +453,57 @@ class LlamaServerManager:
             del self.servers[gpu_id]
             if gpu_id in self.configs:
                 del self.configs[gpu_id]
+            if gpu_id in self._server_ready:
+                del self._server_ready[gpu_id]
         
         return active_servers
     
-    def get_server_port(self, gpu_id: int) -> Optional[int]:
-        """Obtiene el puerto de un servidor específico"""
-        config = self.configs.get(gpu_id)
-        return config.port if config else None
+    async def _wait_for_server_improved(self, port: int, gpu_id: int, timeout: int = 120):
+        """Espera a que el servidor esté listo con mejor manejo de errores"""
+        start_time = time.time()
+        last_error = None
+        
+        # Try different endpoints that llama.cpp server might expose
+        test_endpoints = ["/health", "/v1/models", "/props", "/"]
+        
+        logger.info(f"Esperando servidor GPU {gpu_id} en puerto {port}...")
+        
+        while time.time() - start_time < timeout:
+            process = self.servers.get(gpu_id)
+            if process and process.poll() is not None:
+                # Process has died
+                logger.error(f"Proceso del servidor GPU {gpu_id} murió durante inicialización (exit code: {process.returncode})")
+                logger.error(f"Check logs: ./logs/llama_gpu_{gpu_id}_*.log")
+                raise RuntimeError(f"Proceso del servidor GPU {gpu_id} falló")
+            
+            # Try to connect to any of the endpoints
+            for endpoint in test_endpoints:
+                try:
+                    async with httpx.AsyncClient(timeout=5.0) as client:
+                        response = await client.get(f"http://localhost:{port}{endpoint}")
+                        if response.status_code in [200, 404, 405]:  # 405 Method Not Allowed is also OK
+                            logger.info(f"✅ Servidor GPU {gpu_id} respondiendo en {endpoint} (status: {response.status_code})")
+                            return
+                        else:
+                            logger.debug(f"GPU {gpu_id} endpoint {endpoint} returned {response.status_code}")
+                except Exception as e:
+                    last_error = e
+                    logger.debug(f"Connection attempt failed for GPU {gpu_id} {endpoint}: {e}")
+                    continue
+            
+            logger.debug(f"Waiting for GPU {gpu_id} server... ({time.time() - start_time:.1f}s)")
+            await asyncio.sleep(3)
+        
+        # If we get here, timeout occurred
+        logger.error(f"❌ Timeout esperando servidor GPU {gpu_id} en puerto {port}")
+        logger.error(f"Último error: {last_error}")
+        logger.error(f"Check logs: ./logs/llama_gpu_{gpu_id}_*.log")
+        
+        process = self.servers.get(gpu_id)
+        if process and process.poll() is not None:
+            logger.error(f"Process exit code: {process.returncode}")
+        
+        raise TimeoutError(f"Servidor en puerto {port} no respondió en {timeout}s")
 
 # ============================================================================
 # Load Balancer
@@ -537,12 +516,72 @@ class LoadBalancer:
         self.server_manager = server_manager
         self.current_server = 0
         self.server_stats = {}  # gpu_id -> {"requests": int, "avg_time": float}
+        self._last_health_check = {}  # gpu_id -> timestamp of last successful health check
     
-    def get_next_server(self) -> Optional[int]:
+    async def _check_server_health(self, gpu_id: int) -> bool:
+        """Verifica si un servidor específico está respondiendo"""
+        port = self.server_manager.get_server_port(gpu_id)
+        if not port:
+            return False
+        
+        # Check cache first (avoid too frequent health checks)
+        now = time.time()
+        if gpu_id in self._last_health_check:
+            if now - self._last_health_check[gpu_id] < 5:  # Cache for 5 seconds
+                return True
+        
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                # Try different endpoints that llama.cpp server exposes
+                for endpoint in ["/health", "/v1/models", "/props"]:
+                    try:
+                        response = await client.get(f"http://localhost:{port}{endpoint}")
+                        if response.status_code in [200, 404]:  # 404 is OK, means server is up
+                            self._last_health_check[gpu_id] = now
+                            return True
+                    except:
+                        continue
+                return False
+        except Exception as e:
+            logger.debug(f"Health check failed for GPU {gpu_id}: {e}")
+            return False
+    
+    async def get_available_servers(self) -> List[int]:
+        """Obtiene servidores que están realmente disponibles"""
+        # First get servers that have processes running
+        running_servers = self.server_manager.get_available_servers()
+        
+        if not running_servers:
+            logger.warning("No running server processes found")
+            return []
+        
+        # Then check which ones are actually responding
+        available_servers = []
+        health_checks = await asyncio.gather(
+            *[self._check_server_health(gpu_id) for gpu_id in running_servers],
+            return_exceptions=True
+        )
+        
+        for gpu_id, is_healthy in zip(running_servers, health_checks):
+            if is_healthy is True:
+                available_servers.append(gpu_id)
+            elif isinstance(is_healthy, Exception):
+                logger.debug(f"Health check exception for GPU {gpu_id}: {is_healthy}")
+        
+        return available_servers
+    
+    async def get_next_server(self) -> Optional[int]:
         """Obtiene el próximo servidor usando round-robin"""
-        available_servers = self.server_manager.get_available_servers()
+        available_servers = await self.get_available_servers()
         
         if not available_servers:
+            logger.error("No available servers found")
+            # Debug information
+            running_servers = self.server_manager.get_available_servers()
+            logger.error(f"Running processes: {running_servers}")
+            for gpu_id in running_servers:
+                port = self.server_manager.get_server_port(gpu_id)
+                logger.error(f"GPU {gpu_id} -> Port {port}")
             return None
         
         # Round-robin simple
@@ -554,16 +593,16 @@ class LoadBalancer:
         
         return gpu_id
     
-    def get_best_server(self) -> Optional[int]:
+    async def get_best_server(self) -> Optional[int]:
         """Obtiene el servidor con mejor rendimiento"""
-        available_servers = self.server_manager.get_available_servers()
+        available_servers = await self.get_available_servers()
         
         if not available_servers:
             return None
         
         # Si no hay estadísticas, usar round-robin
         if not any(server in self.server_stats for server in available_servers):
-            return self.get_next_server()
+            return await self.get_next_server()
         
         # Encontrar servidor con menor carga
         best_server = min(
@@ -595,9 +634,9 @@ class LoadBalancer:
 class LlamaClient:
     """Cliente para comunicarse con servidores llama.cpp"""
 
-    def __init__(self, load_balancer: LoadBalancer, host: str = "0.0.0.0"):
+    def __init__(self, load_balancer: LoadBalancer, host: str = "localhost"):
         self.load_balancer = load_balancer
-        self.host = host  # Allow configurable host
+        self.host = host
         self.session = None
     
     async def __aenter__(self):
@@ -612,10 +651,19 @@ class LlamaClient:
     
     async def generate_completion(self, request: CompletionRequest) -> Dict[str, Any]:
         """Genera una completion usando el mejor servidor disponible"""
-        gpu_id = self.load_balancer.get_best_server()
-
-        #if gpu_id is None:
-        #    raise HTTPException(status_code=503, detail="No hay servidores disponibles")
+        gpu_id = await self.load_balancer.get_best_server()  # NOW ASYNC!
+        
+        if gpu_id is None:
+            # Better error reporting
+            running_servers = self.load_balancer.server_manager.get_available_servers()
+            available_servers = await self.load_balancer.get_available_servers()
+            
+            error_msg = f"No hay servidores disponibles. "
+            error_msg += f"Procesos ejecutándose: {running_servers}, "
+            error_msg += f"Servidores respondiendo: {available_servers}"
+            
+            logger.error(error_msg)
+            raise HTTPException(status_code=503, detail=error_msg)
         
         port = self.load_balancer.server_manager.get_server_port(gpu_id)
         url = f"http://{self.host}:{port}/completion"
@@ -634,9 +682,11 @@ class LlamaClient:
         start_time = time.time()
         
         try:
+            logger.debug(f"Enviando request a GPU {gpu_id} (puerto {port})")
             async with self.session.post(url, json=payload) as response:
                 if response.status != 200:
                     error_text = await response.text()
+                    logger.error(f"Error del servidor GPU {gpu_id}: {response.status} - {error_text}")
                     raise HTTPException(
                         status_code=response.status,
                         detail=f"Error del servidor GPU {gpu_id}: {error_text}"
@@ -652,59 +702,12 @@ class LlamaClient:
                 result["gpu_id"] = gpu_id
                 result["processing_time"] = processing_time
                 
+                logger.debug(f"✅ Completion exitosa en GPU {gpu_id} ({processing_time:.2f}s)")
                 return result
                 
         except Exception as e:
             logger.error(f"Error comunicándose con servidor GPU {gpu_id}: {e}")
             raise HTTPException(status_code=500, detail=str(e))
-    
-    async def generate_completion_stream(self, request: CompletionRequest) -> AsyncGenerator[str, None]:
-        """Genera completion con streaming"""
-        gpu_id = self.load_balancer.get_best_server()
-        if gpu_id is None:
-            raise HTTPException(status_code=503, detail="No hay servidores disponibles")
-        
-        port = self.load_balancer.server_manager.get_server_port(gpu_id)
-        url = f"http://127.0.0.1:{port}/completion"
-        
-        payload = {
-            "prompt": request.prompt,
-            "n_predict": request.max_tokens,
-            "temperature": request.temperature,
-            "top_p": request.top_p,
-            "top_k": request.top_k,
-            "repeat_penalty": request.repeat_penalty,
-            "stop": request.stop or [],
-            "stream": True
-        }
-        
-        start_time = time.time()
-        
-        try:
-            async with self.session.post(url, json=payload) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    raise HTTPException(
-                        status_code=response.status,
-                        detail=f"Error del servidor GPU {gpu_id}: {error_text}"
-                    )
-                
-                async for line in response.content:
-                    line_str = line.decode('utf-8').strip()
-                    if line_str.startswith('data: '):
-                        try:
-                            data = json.loads(line_str[6:])
-                            if 'content' in data:
-                                yield f"data: {json.dumps(data)}\n\n"
-                        except json.JSONDecodeError:
-                            continue
-                
-                processing_time = time.time() - start_time
-                self.load_balancer.update_server_stats(gpu_id, processing_time)
-                
-        except Exception as e:
-            logger.error(f"Error en streaming GPU {gpu_id}: {e}")
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
 # ============================================================================
 # Gestor de Embeddings
@@ -851,9 +854,8 @@ async def create_completion(request: CompletionRequest):
             media_type="text/event-stream"
         )
     
-    # Use environment-appropriate host
-    client_host = getattr(app.state, 'client_host', 'localhost')
-    async with LlamaClient(load_balancer, host=client_host) as client:
+    # Use localhost for internal communication (more reliable than 0.0.0.0)
+    async with LlamaClient(load_balancer, host="localhost") as client:
         result = await client.generate_completion(request)
         
         return CompletionResponse(
@@ -978,6 +980,35 @@ async def get_system_stats():
             "memory_percent": psutil.virtual_memory().percent,
             "memory_used_gb": round(psutil.virtual_memory().used / (1024**3), 2)
         }
+    }
+
+@app.get("/debug/servers")
+async def debug_servers():
+    """Endpoint de debug para verificar estado de servidores"""
+    running_servers = server_manager.get_available_servers()
+    available_servers = await load_balancer.get_available_servers()
+    
+    server_details = []
+    for gpu_id in server_manager.servers.keys():
+        process = server_manager.servers[gpu_id]
+        config = server_manager.configs.get(gpu_id)
+        
+        server_details.append({
+            "gpu_id": gpu_id,
+            "port": config.port if config else None,
+            "process_alive": process.poll() is None,
+            "process_pid": process.pid,
+            "ready_flag": server_manager._server_ready.get(gpu_id, False),
+            "in_running_list": gpu_id in running_servers,
+            "in_available_list": gpu_id in available_servers,
+            "stats": load_balancer.server_stats.get(gpu_id, {})
+        })
+    
+    return {
+        "running_servers": running_servers,
+        "available_servers": available_servers,
+        "server_details": server_details,
+        "load_balancer_stats": load_balancer.server_stats
     }
 
 # ============================================================================
