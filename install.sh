@@ -138,7 +138,8 @@ if [ "$USE_CUDA" = true ]; then
     cmake .. \
         -DGGML_CUDA=ON \
         -DCMAKE_BUILD_TYPE=Release \
-        -DGGML_CUDA_F16=ON
+        -DGGML_CUDA_F16=ON \
+        -DLLAMA_CURL=OFF
 else
     echo "   💾 Compilando solo para CPU..."
     cmake .. \
