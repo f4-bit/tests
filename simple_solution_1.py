@@ -13,18 +13,14 @@ model_path = hf_hub_download(
     local_dir="./models",
 )
 
-# Configuración directa como dict (estilo config.json)
+# Configuración correcta - sin envolver en "models"
 server_settings = {
-    "models": [
-        {
-            "model": model_path,
-            "n_gpu_layers": -1,
-            "n_ctx": 4096,
-            "n_batch": 512,
-            "verbose": True,
-            # "chat_format": "qwen2",  # opcional
-        }
-    ]
+    "model": model_path,
+    "n_gpu_layers": -1,
+    "n_ctx": 4096,
+    "n_batch": 512,
+    "verbose": True,
+    # "chat_format": "qwen2",  # opcional
 }
 
 # Crear la app del servidor
