@@ -351,7 +351,7 @@ class LlamaServerManager:
             "-b", str(config.batch_size),
             "-ngl", "-1",  # Todas las capas en GPU
             "--threads", "8",
-            "--log-format", "json",
+            #"--log-format", "json",
             "-v"
         ]
         
