@@ -1140,7 +1140,7 @@ async def main():
     health_config = uvicorn.Config(
         health_server.app,
         host=args.host,
-        port=3001,  # Puerto diferente para health check
+        port=8080,  # Puerto diferente para health check
         log_level=args.log_level.lower(),
         access_log=False
     )
