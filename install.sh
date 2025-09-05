@@ -123,11 +123,23 @@ if [ -d "llama.cpp" ]; then
     rm -rf llama.cpp
 fi
 
-# Clonar repositorio
-git clone https://github.com/ggerganov/llama.cpp
+# Clonar o actualizar repositorio
+if [ -d "llama.cpp" ]; then
+    echo "📂 Repositorio llama.cpp ya existe, actualizando..."
+    cd llama.cpp
+    git fetch --all
+    git reset --hard origin/master
+    cd ..
+else
+    echo "⬇️ Clonando repositorio llama.cpp..."
+    git clone https://github.com/ggerganov/llama.cpp
+fi
+
 cd llama.cpp
 
-# Crear directorio build
+# Limpiar build previo
+echo "🧹 Limpiando compilación previa..."
+rm -rf build
 mkdir build
 cd build
 
@@ -160,13 +172,9 @@ if [ -f "bin/llama-server" ]; then
     ln -sf build/bin/llama-server server
     echo "🔗 Creado symlink: llama.cpp/server -> build/bin/llama-server"
     
-    # Probar que funciona
+    # Probar que funciona y ver flags disponibles
     echo "🧪 Probando servidor..."
-    if ./server --help > /dev/null 2>&1; then
-        echo "✅ Servidor funciona correctamente"
-    else
-        echo "⚠️  Advertencia: Error probando el servidor"
-    fi
+    ./server --help | grep log || echo "⚠️  Advertencia: opción --log-format no disponible en esta build"
 else
     echo "❌ Error: No se pudo compilar llama-server"
     exit 1
