@@ -332,7 +332,7 @@ class LlamaServerManager:
         while time.time() - start_time < timeout:
             try:
                 async with httpx.AsyncClient() as client:
-                    response = await client.get(f"http://127.0.0.1:{port}/health", timeout=2)
+                    response = await client.get(f"http://0.0.0.0:{port}/health", timeout=2)
                     if response.status_code == 200:
                         return
             except:
