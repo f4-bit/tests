@@ -2,7 +2,6 @@ import os
 from uvicorn import run
 from huggingface_hub import hf_hub_download
 from llama_cpp.server.app import create_app
-from llama_cpp.server.settings import ServerSettings
 
 # Usa GPU 0
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -14,9 +13,9 @@ model_path = hf_hub_download(
     local_dir="./models",
 )
 
-# Configuración del servidor (usar dicts, no ModelSettings)
-server_settings = ServerSettings(
-    models=[
+# Configuración directa como dict (estilo config.json)
+server_settings = {
+    "models": [
         {
             "model": model_path,
             "n_gpu_layers": -1,
@@ -26,9 +25,9 @@ server_settings = ServerSettings(
             # "chat_format": "qwen2",  # opcional
         }
     ]
-)
+}
 
-# Crear la app
+# Crear la app del servidor
 app = create_app(server_settings)
 
 # Endpoint extra opcional
