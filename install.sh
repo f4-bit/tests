@@ -23,7 +23,8 @@ pip install transformers accelerate bitsandbytes
 
 # Instalar Unsloth
 echo "⚡ Instalando Unsloth..."
-pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
+pip install unsloth
+pip install unsloth_zoo
 
 # Instalar utilidades
 echo "🔧 Instalando utilidades..."
