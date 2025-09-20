@@ -41,7 +41,7 @@ class QueueItem:
     future: asyncio.Future
 
 class ModelManager:
-    def __init__(self, model_name: str = "unsloth/Qwen2.5-Coder-32B-Instruct"):
+    def __init__(self, model_name: str = "unsloth/Qwen3-Coder-30B-A3B-Instruct"):
         self.model_name = model_name
         self.model = None
         self.tokenizer = None
@@ -79,22 +79,21 @@ class ModelManager:
         try:
             # Tokenizar el batch
             inputs = self.tokenizer(
-                texts, 
-                return_tensors="pt", 
-                padding=True, 
+                texts,
+                return_tensors="pt",
+                padding="longest",
                 truncation=True,
-                max_length=512
             ).to(self.device)
-            
+                        
             # Generar respuestas
             with torch.no_grad():
                 outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=max(max_lengths),
-                    temperature=max(temperatures),
-                    do_sample=True,
-                    pad_token_id=self.tokenizer.eos_token_id
-                )
+                **inputs,
+                max_new_tokens=max(max_lengths),
+                temperature=0.0,
+                do_sample=False,
+                pad_token_id=self.tokenizer.eos_token_id
+            )
             
             # Decodificar respuestas
             responses = []
@@ -209,7 +208,7 @@ async def lifespan(app: FastAPI):
     print("Iniciando sistema de inferencia...")
     model_manager = ModelManager()
     model_manager.load_model()
-    batch_processor = BatchProcessor(model_manager, batch_size=8, max_wait_time=0.5)
+    batch_processor = BatchProcessor(model_manager, batch_size=4, max_wait_time=0.1)
     print("Sistema listo!")
     
     yield
