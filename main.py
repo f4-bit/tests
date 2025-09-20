@@ -57,7 +57,7 @@ class ModelManager:
         try:
             self.model, self.tokenizer = FastLanguageModel.from_pretrained(
                 model_name=self.model_name,
-                max_seq_length=2048,
+                max_seq_length=8192,
                 dtype=None,
                 load_in_4bit=True,
             )
@@ -132,36 +132,35 @@ class BatchProcessor:
             asyncio.create_task(self.process_queue())
     
     async def process_queue(self):
-        """Procesa la cola en batches concurrentes"""
+        """Procesa la cola en batches"""
         if self.processing:
             return
-
+            
         self.processing = True
+        
         try:
             while True:
                 # Esperar hasta tener requests o timeout
                 start_wait = time.time()
                 while len(self.queue) == 0 and (time.time() - start_wait) < self.max_wait_time:
                     await asyncio.sleep(0.01)
-
+                
                 if len(self.queue) == 0:
                     break
-
+                
+                # Extraer batch
                 batch_items = []
                 with self.lock:
                     for _ in range(min(self.batch_size, len(self.queue))):
                         if self.queue:
                             batch_items.append(self.queue.popleft())
-
+                
                 if not batch_items:
                     break
-
-                # 🔑 Lanzar el batch como tarea en paralelo
-                asyncio.create_task(self.process_batch(batch_items))
-
-                # 🔑 No esperamos a que termine este batch, seguimos viendo la cola
-                await asyncio.sleep(0)  # ceder control al event loop
-
+                
+                # Procesar batch
+                await self.process_batch(batch_items)
+                
         finally:
             self.processing = False
     
@@ -290,6 +289,6 @@ if __name__ == "__main__":
         "main:app",  # Ajusta el nombre del archivo
         host="0.0.0.0",
         port=8000,
-        reload=False,  # ← Cambiar a False para producción
+        reload=False,
         log_level="info"
     )
