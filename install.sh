@@ -32,4 +32,3 @@ echo "🔧 Instalando utilidades..."
 pip install pydantic python-multipart
 
 echo "✅ ¡Instalación completada!"
-python main.py
