@@ -1,4 +1,3 @@
-
 from unsloth import FastLanguageModel
 import torch
 import asyncio
@@ -14,17 +13,13 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn
 
-#import os
-#os.environ["TORCH_LOGS"] = "+dynamo"
-#os.environ["TORCHDYNAMO_VERBOSE=1"] = "1"
-
-
 # Modelos de datos
 class InferenceRequest(BaseModel):
     text: str
     max_length: Optional[int] = 512
     temperature: Optional[float] = 0.7
     request_id: Optional[str] = None
+    system_prompt: Optional[str] = None
 
 class InferenceResponse(BaseModel):
     request_id: str
@@ -39,6 +34,7 @@ class QueueItem:
     temperature: float
     timestamp: float
     future: asyncio.Future
+    system_prompt: Optional[str] = None
 
 class ModelManager:
     def __init__(self, model_name: str = "unsloth/Qwen3-Coder-30B-A3B-Instruct"):
@@ -69,31 +65,59 @@ class ModelManager:
             print(f"Error cargando modelo: {e}")
             print("Usando modelo mock para demostración")
     
+    def format_qwen_prompt(self, user_text: str, system_prompt: Optional[str] = None) -> str:
+        """Formatea el prompt usando los tokens nativos de Qwen"""
+        if system_prompt is None:
+            system_prompt = "Proporciona una respuesta genérica usando como base el contexto proporcionado. No menciones que se hizo una consulta SQL, ni qué hace el SQL, ni menciones las tablas, no te extiendas en explicar."
+        
+        formatted_prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+{system_prompt}<|eot_id|><|start_header_id|>user<|end_header_id|>
+{user_text}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+"""
+        return formatted_prompt
+    
     def generate_batch(self, texts: List[str], max_lengths: List[int], 
-                      temperatures: List[float]) -> List[str]:
-        """Genera respuestas en batch"""
+                      temperatures: List[float], system_prompts: List[Optional[str]]) -> List[str]:
+        """Genera respuestas en batch usando formato nativo de Qwen"""
         if self.model is None or self.tokenizer is None:
             # Mock generation para demostración
             return [f"Respuesta generada para: {text[:50]}..." for text in texts]
         
         try:
+            # Formatear todos los prompts usando el formato nativo de Qwen
+            formatted_texts = []
+            for text, system_prompt in zip(texts, system_prompts):
+                formatted_prompt = self.format_qwen_prompt(text, system_prompt)
+                formatted_texts.append(formatted_prompt)
+            
             # Tokenizar el batch
             inputs = self.tokenizer(
-                texts,
+                formatted_texts,
                 return_tensors="pt",
                 padding="longest",
                 truncation=True,
+                max_length=8192 - max(max_lengths)  # Reservar espacio para la generación
             ).to(self.device)
-                        
+            
+            # Usar diferentes temperaturas por request si es necesario
+            avg_temperature = sum(temperatures) / len(temperatures)
+            do_sample = avg_temperature > 0.0
+            
             # Generar respuestas
             with torch.no_grad():
                 outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=max(max_lengths),
-                temperature=0.0,
-                do_sample=False,
-                pad_token_id=self.tokenizer.eos_token_id
-            )
+                    **inputs,
+                    max_new_tokens=max(max_lengths),
+                    temperature=avg_temperature if do_sample else None,
+                    do_sample=do_sample,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    # Parámetros adicionales para mejorar calidad
+                    top_p=0.9 if do_sample else None,
+                    repetition_penalty=1.1,
+                    # Asegurar que termine en el token correcto
+                    stop_strings=["<|eot_id|>"] if hasattr(self.tokenizer, 'stop_strings') else None
+                )
             
             # Decodificar respuestas
             responses = []
@@ -102,6 +126,9 @@ class ModelManager:
                 input_length = inputs.input_ids[i].shape[0]
                 generated = output[input_length:]
                 response = self.tokenizer.decode(generated, skip_special_tokens=True)
+                
+                # Limpiar la respuesta (remover tokens especiales que puedan quedar)
+                response = self.clean_response(response)
                 responses.append(response)
             
             return responses
@@ -109,6 +136,22 @@ class ModelManager:
         except Exception as e:
             print(f"Error en generación: {e}")
             return [f"Error generando respuesta para: {text[:50]}..." for text in texts]
+    
+    def clean_response(self, response: str) -> str:
+        """Limpia la respuesta removiendo tokens especiales que puedan quedar"""
+        # Remover tokens de Qwen que puedan aparecer en la respuesta
+        tokens_to_remove = [
+            "<|eot_id|>", "<|start_header_id|>", "<|end_header_id|>",
+            "<|begin_of_text|>", "system", "user", "assistant"
+        ]
+        
+        for token in tokens_to_remove:
+            response = response.replace(token, "")
+        
+        # Limpiar espacios en blanco extra
+        response = response.strip()
+        
+        return response
 
 class BatchProcessor:
     def __init__(self, model_manager: ModelManager, batch_size: int = 4, 
@@ -173,10 +216,11 @@ class BatchProcessor:
         texts = [item.text for item in batch_items]
         max_lengths = [item.max_length for item in batch_items]
         temperatures = [item.temperature for item in batch_items]
+        system_prompts = [item.system_prompt for item in batch_items]
         
         # Generar respuestas
         try:
-            responses = self.model_manager.generate_batch(texts, max_lengths, temperatures)
+            responses = self.model_manager.generate_batch(texts, max_lengths, temperatures, system_prompts)
             processing_time = time.time() - start_time
             
             # Enviar respuestas a los futures
@@ -218,9 +262,9 @@ async def lifespan(app: FastAPI):
 
 # Crear aplicación FastAPI
 app = FastAPI(
-    title="Unsloth Batch Inference API",
-    description="API de inferencia con batching usando Unsloth y colas",
-    version="1.0.0",
+    title="Unsloth Batch Inference API with Qwen Native Format",
+    description="API de inferencia con batching usando Unsloth y formato nativo de Qwen",
+    version="1.1.0",
     lifespan=lifespan
 )
 
@@ -243,7 +287,8 @@ async def generate_text(request: InferenceRequest):
         max_length=request.max_length or 512,
         temperature=request.temperature or 0.7,
         timestamp=time.time(),
-        future=future
+        future=future,
+        system_prompt=request.system_prompt
     )
     
     # Añadir a la cola
