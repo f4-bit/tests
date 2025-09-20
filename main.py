@@ -15,8 +15,8 @@ from pydantic import BaseModel
 import uvicorn
 
 import os
-#os.environ["TORCH_LOGS"] = ""
-#os.environ["TORCH_COMPILE_DISABLE"] = "1"
+os.environ["TORCH_LOGS"] = "+dynamo"
+os.environ["TORCHDYNAMO_VERBOSE=1"] = "1"
 
 
 # Modelos de datos
