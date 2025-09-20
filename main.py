@@ -132,37 +132,36 @@ class BatchProcessor:
             asyncio.create_task(self.process_queue())
     
     async def process_queue(self):
-        """Procesa la cola en batches"""
+        """Procesa la cola en batches concurrentes"""
         if self.processing:
             return
-            
+
         self.processing = True
-        
         try:
             while True:
                 # Esperar hasta tener requests o timeout
                 start_wait = time.time()
                 while len(self.queue) == 0 and (time.time() - start_wait) < self.max_wait_time:
                     await asyncio.sleep(0.01)
-                
+
                 if len(self.queue) == 0:
                     break
-                
-                # PROCESAR TODOS LOS BATCHES DISPONIBLES
-                while len(self.queue) > 0:
-                    # Extraer batch
-                    batch_items = []
-                    with self.lock:
-                        for _ in range(min(self.batch_size, len(self.queue))):
-                            if self.queue:
-                                batch_items.append(self.queue.popleft())
-                    
-                    if not batch_items:
-                        break
-                    
-                    # Procesar batch inmediatamente
-                    await self.process_batch(batch_items)
-                
+
+                batch_items = []
+                with self.lock:
+                    for _ in range(min(self.batch_size, len(self.queue))):
+                        if self.queue:
+                            batch_items.append(self.queue.popleft())
+
+                if not batch_items:
+                    break
+
+                # 🔑 Lanzar el batch como tarea en paralelo
+                asyncio.create_task(self.process_batch(batch_items))
+
+                # 🔑 No esperamos a que termine este batch, seguimos viendo la cola
+                await asyncio.sleep(0)  # ceder control al event loop
+
         finally:
             self.processing = False
     
