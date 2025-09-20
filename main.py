@@ -57,7 +57,7 @@ class ModelManager:
         try:
             self.model, self.tokenizer = FastLanguageModel.from_pretrained(
                 model_name=self.model_name,
-                max_seq_length=8192,
+                max_seq_length=2048,
                 dtype=None,
                 load_in_4bit=True,
             )
@@ -148,18 +148,20 @@ class BatchProcessor:
                 if len(self.queue) == 0:
                     break
                 
-                # Extraer batch
-                batch_items = []
-                with self.lock:
-                    for _ in range(min(self.batch_size, len(self.queue))):
-                        if self.queue:
-                            batch_items.append(self.queue.popleft())
-                
-                if not batch_items:
-                    break
-                
-                # Procesar batch
-                await self.process_batch(batch_items)
+                # PROCESAR TODOS LOS BATCHES DISPONIBLES
+                while len(self.queue) > 0:
+                    # Extraer batch
+                    batch_items = []
+                    with self.lock:
+                        for _ in range(min(self.batch_size, len(self.queue))):
+                            if self.queue:
+                                batch_items.append(self.queue.popleft())
+                    
+                    if not batch_items:
+                        break
+                    
+                    # Procesar batch inmediatamente
+                    await self.process_batch(batch_items)
                 
         finally:
             self.processing = False
@@ -210,7 +212,7 @@ async def lifespan(app: FastAPI):
     print("Iniciando sistema de inferencia...")
     model_manager = ModelManager()
     model_manager.load_model()
-    batch_processor = BatchProcessor(model_manager, batch_size=4, max_wait_time=0.5)
+    batch_processor = BatchProcessor(model_manager, batch_size=2, max_wait_time=0.1)
     print("Sistema listo!")
     
     yield
@@ -289,6 +291,6 @@ if __name__ == "__main__":
         "main:app",  # Ajusta el nombre del archivo
         host="0.0.0.0",
         port=8000,
-        reload=False,
+        reload=False,  # ← Cambiar a False para producción
         log_level="info"
     )
