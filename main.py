@@ -22,7 +22,7 @@ import uvicorn
 # Modelos de datos
 class InferenceRequest(BaseModel):
     text: str
-    max_length: Optional[int] = 100
+    max_length: Optional[int] = 512
     temperature: Optional[float] = 0.7
     request_id: Optional[str] = None
 
@@ -241,7 +241,7 @@ async def generate_text(request: InferenceRequest):
     queue_item = QueueItem(
         request_id=request_id,
         text=request.text,
-        max_length=request.max_length or 100,
+        max_length=request.max_length or 512,
         temperature=request.temperature or 0.7,
         timestamp=time.time(),
         future=future
