@@ -57,7 +57,7 @@ class ModelManager:
         try:
             self.model, self.tokenizer = FastLanguageModel.from_pretrained(
                 model_name=self.model_name,
-                max_seq_length=2048,
+                max_seq_length=8192,
                 dtype=None,
                 load_in_4bit=True,
             )
