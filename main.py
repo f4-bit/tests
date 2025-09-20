@@ -212,7 +212,7 @@ async def lifespan(app: FastAPI):
     print("Iniciando sistema de inferencia...")
     model_manager = ModelManager()
     model_manager.load_model()
-    batch_processor = BatchProcessor(model_manager, batch_size=2, max_wait_time=0.1)
+    batch_processor = BatchProcessor(model_manager, batch_size=4, max_wait_time=0.5)
     print("Sistema listo!")
     
     yield
