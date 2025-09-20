@@ -1,1500 +1,294 @@
 import asyncio
-import aiohttp
-import aiofiles
-import argparse
-import json
-import logging
-import os
-import subprocess
-import time
-import signal
-import sys
-from pathlib import Path
-from typing import Dict, List, Optional, Any, AsyncGenerator
+import uuid
+from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
+from collections import deque
+import time
+import threading
 from contextlib import asynccontextmanager
-from urllib.parse import urlparse
-import socket
 
-import psutil
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 import uvicorn
-from sentence_transformers import SentenceTransformer
-import torch
-import httpx
-from huggingface_hub import hf_hub_download, snapshot_download
-from huggingface_hub.utils import HfHubHTTPError
 
-# Configuración de logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# Simulamos la importación de unsloth (ajusta según tu instalación)
+try:
+    from unsloth import FastLanguageModel
+    import torch
+except ImportError:
+    print("Unsloth no encontrado. Usando mock para demostración.")
+    FastLanguageModel = None
+    torch = None
 
-# ============================================================================
-# Modelos Pydantic para la API
-# ============================================================================
+# Modelos de datos
+class InferenceRequest(BaseModel):
+    text: str
+    max_length: Optional[int] = 100
+    temperature: Optional[float] = 0.7
+    request_id: Optional[str] = None
 
-class CompletionRequest(BaseModel):
-    prompt: str = Field(..., description="El prompt para generar")
-    max_tokens: int = Field(default=4096, ge=1, le=8192, description="Máximo tokens a generar")
-    temperature: float = Field(default=0.7, ge=0.0, le=2.0, description="Temperatura de muestreo")
-    top_p: float = Field(default=0.9, ge=0.0, le=1.0, description="Top-p sampling")
-    top_k: int = Field(default=40, ge=1, le=100, description="Top-k sampling")
-    repeat_penalty: float = Field(default=1.1, ge=0.0, le=2.0, description="Penalidad por repetición")
-    stop: Optional[List[str]] = Field(default=None, description="Tokens de parada")
-    stream: bool = Field(default=False, description="Streaming response")
-
-class ChatMessage(BaseModel):
-    role: str = Field(..., pattern="^(system|user|assistant)$")
-    content: str
-
-class ChatCompletionRequest(BaseModel):
-    messages: List[ChatMessage] = Field(..., description="Mensajes del chat")
-    max_tokens: int = Field(default=4096, ge=1, le=8192)
-    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
-    top_p: float = Field(default=0.9, ge=0.0, le=1.0)
-    top_k: int = Field(default=40, ge=1, le=100)
-    repeat_penalty: float = Field(default=1.1, ge=0.0, le=2.0)
-    stop: Optional[List[str]] = Field(default=None)
-    stream: bool = Field(default=False)
-
-class EmbeddingRequest(BaseModel):
-    input: str = Field(..., description="Texto para generar embeddings")
-    model: str = Field(default="all-MiniLM-L6-v2", description="Modelo de embeddings")
-
-class CompletionResponse(BaseModel):
-    id: str
-    object: str = "text_completion"
-    created: int
-    choices: List[Dict[str, Any]]
-    usage: Dict[str, int]
-
-class EmbeddingResponse(BaseModel):
-    object: str = "list"
-    data: List[Dict[str, Any]]
-    usage: Dict[str, int]
-
-# ============================================================================
-# Gestión de GPUs y Distribución
-# ============================================================================
+class InferenceResponse(BaseModel):
+    request_id: str
+    generated_text: str
+    processing_time: float
 
 @dataclass
-class GPUInfo:
-    id: int
-    name: str
-    memory_total: int  # MB
-    memory_free: int   # MB
-    utilization: int   # %
-    temperature: int   # C
+class QueueItem:
+    request_id: str
+    text: str
+    max_length: int
+    temperature: float
+    timestamp: float
+    future: asyncio.Future
 
-class GPUManager:
-    """Gestiona información y distribución de GPUs"""
-    
-    def __init__(self):
-        self.gpus: List[GPUInfo] = []
-        self.refresh_gpu_info()
-    
-    def refresh_gpu_info(self):
-        """Actualiza información de GPUs disponibles"""
+class ModelManager:
+    def __init__(self, model_name: str = "unsloth/llama-2-7b-bnb-4bit"):
+        self.model_name = model_name
+        self.model = None
+        self.tokenizer = None
+        self.device = "cuda" if torch and torch.cuda.is_available() else "cpu"
+        
+    def load_model(self):
+        """Carga el modelo de Unsloth"""
+        if FastLanguageModel is None:
+            print("Usando modelo mock para demostración")
+            return
+            
         try:
-            result = subprocess.run([
-                'nvidia-smi',
-                '--query-gpu=index,name,memory.total,memory.free,utilization.gpu,temperature.gpu',
-                '--format=csv,noheader,nounits'
-            ], capture_output=True, text=True, timeout=10)
-            
-            if result.returncode == 0:
-                self.gpus = []
-                for line in result.stdout.strip().split('\n'):
-                    if line:
-                        values = [v.strip() for v in line.split(',')]
-                        self.gpus.append(GPUInfo(
-                            id=int(values[0]),
-                            name=values[1],
-                            memory_total=int(values[2]),
-                            memory_free=int(values[3]),
-                            utilization=int(values[4]) if values[4] != '[Not Supported]' else 0,
-                            temperature=int(values[5]) if values[5] != '[Not Supported]' else 0
-                        ))
-                        
-                logger.info(f"Detectadas {len(self.gpus)} GPUs")
-                for gpu in self.gpus:
-                    logger.info(f"  GPU {gpu.id}: {gpu.name} - {gpu.memory_free}/{gpu.memory_total} MB libre")
-            else:
-                logger.warning(f"nvidia-smi falló con código {result.returncode}: {result.stderr}")
-                self._create_fallback_gpu()
-                        
-        except FileNotFoundError:
-            logger.warning("nvidia-smi no encontrado")
-            self._create_fallback_gpu()
-        except Exception as e:
-            logger.error(f"Error detectando GPUs: {e}")
-            self._create_fallback_gpu()
-    
-    def _create_fallback_gpu(self):
-        """Crea una GPU fallback para entornos donde nvidia-smi no funciona"""
-        try:
-            import torch
-            if torch.cuda.is_available():
-                gpu_count = torch.cuda.device_count()
-                logger.info(f"Fallback: detectadas {gpu_count} GPUs via PyTorch")
-                
-                self.gpus = []
-                for i in range(gpu_count):
-                    props = torch.cuda.get_device_properties(i)
-                    total_memory = props.total_memory // (1024 * 1024)
-                    free_memory = int(total_memory * 0.8)
-                    
-                    self.gpus.append(GPUInfo(
-                        id=i,
-                        name=props.name,
-                        memory_total=total_memory,
-                        memory_free=free_memory,
-                        utilization=0,
-                        temperature=0
-                    ))
-                    logger.info(f"  Fallback GPU {i}: {props.name} - ~{free_memory}MB libre (estimado)")
-            else:
-                logger.warning("CUDA no disponible, asumiendo GPU 0")
-                self.gpus = [GPUInfo(id=0, name="Unknown", memory_total=0, memory_free=0, utilization=0, temperature=0)]
-        except ImportError:
-            logger.warning("PyTorch no disponible, asumiendo GPU 0")
-            self.gpus = [GPUInfo(id=0, name="Unknown", memory_total=0, memory_free=0, utilization=0, temperature=0)]
-        except Exception as e:
-            logger.error(f"Error en fallback GPU detection: {e}")
-            self.gpus = [GPUInfo(id=0, name="Unknown", memory_total=0, memory_free=0, utilization=0, temperature=0)]
-    
-    def get_available_gpus(self, min_memory_gb: float = 18.0) -> List[int]:
-        """Obtiene GPUs con suficiente memoria libre"""
-        if not self.gpus:
-            logger.warning("No hay GPUs detectadas, intentando GPU 0 como fallback")
-            return [0]
-            
-        min_memory_mb = min_memory_gb * 1024
-        available = [
-            gpu.id for gpu in self.gpus 
-            if gpu.memory_free >= min_memory_mb or gpu.memory_total == 0
-        ]
-        
-        if not available:
-            logger.warning(f"Ninguna GPU cumple {min_memory_gb}GB, usando todas disponibles")
-            available = [gpu.id for gpu in self.gpus]
-        
-        return available
-    
-    def get_best_gpu(self, exclude: List[int] = None) -> Optional[int]:
-        """Obtiene la GPU con más memoria libre"""
-        exclude = exclude or []
-        available_gpus = [gpu for gpu in self.gpus if gpu.id not in exclude]
-        
-        if not available_gpus:
-            return 0
-            
-        best_gpu = max(available_gpus, key=lambda g: g.memory_free)
-        return best_gpu.id
-
-# ============================================================================
-# Descarga de Modelos
-# ============================================================================
-
-class ModelDownloader:
-    """Descarga modelos de Hugging Face usando huggingface_hub oficial"""
-    
-    def __init__(self, base_dir: str = "./models"):
-        self.base_dir = Path(base_dir)
-        self.base_dir.mkdir(exist_ok=True)
-        
-    async def download_model(self, repo_id: str, filename: str) -> Path:
-        """Descarga un modelo específico de HuggingFace usando huggingface_hub"""
-        try:
-            logger.info(f"Verificando modelo: {repo_id}/{filename}")
-            
-            model_path = await asyncio.to_thread(
-                self._sync_download_model, 
-                repo_id, 
-                filename
+            self.model, self.tokenizer = FastLanguageModel.from_pretrained(
+                model_name=self.model_name,
+                max_seq_length=2048,
+                dtype=None,
+                load_in_4bit=True,
             )
             
-            logger.info(f"Modelo disponible en: {model_path}")
-            return Path(model_path)
-            
-        except HfHubHTTPError as e:
-            logger.error(f"Error de Hugging Face Hub: {e}")
-            if e.response.status_code == 404:
-                raise HTTPException(
-                    status_code=404, 
-                    detail=f"Modelo no encontrado: {repo_id}/{filename}"
-                )
-            elif e.response.status_code == 401:
-                raise HTTPException(
-                    status_code=401, 
-                    detail="Token de Hugging Face requerido para este modelo privado"
-                )
-            else:
-                raise HTTPException(
-                    status_code=500, 
-                    detail=f"Error descargando modelo: HTTP {e.response.status_code}"
-                )
-        except Exception as e:
-            logger.error(f"Error descargando modelo: {str(e)}")
-            raise HTTPException(
-                status_code=500, 
-                detail=f"Error descargando modelo: {str(e)}"
-            )
-    
-    def _sync_download_model(self, repo_id: str, filename: str) -> str:
-        """Descarga síncrona usando huggingface_hub oficial"""
-        try:
-            logger.info(f"Descargando {filename} desde {repo_id}...")
-            
-            model_path = hf_hub_download(
-                repo_id=repo_id,
-                filename=filename,
-                cache_dir=str(self.base_dir),
-                resume_download=True,
-                local_files_only=False,
-            )
-            
-            logger.info(f"Descarga completada: {model_path}")
-            return model_path
+            # Habilitar inferencia rápida
+            FastLanguageModel.for_inference(self.model)
+            print(f"Modelo {self.model_name} cargado exitosamente")
             
         except Exception as e:
-            logger.error(f"Error en hf_hub_download: {e}")
-            
-            try:
-                logger.info("Intentando con snapshot_download como fallback...")
-                
-                snapshot_path = snapshot_download(
-                    repo_id=repo_id,
-                    cache_dir=str(self.base_dir),
-                    resume_download=True,
-                    allow_patterns=[filename],
-                )
-                
-                model_path = os.path.join(snapshot_path, filename)
-                if os.path.exists(model_path):
-                    logger.info(f"Descarga fallback completada: {model_path}")
-                    return model_path
-                else:
-                    raise FileNotFoundError(f"Archivo {filename} no encontrado en snapshot")
-                    
-            except Exception as e2:
-                logger.error(f"Error en snapshot_download: {e2}")
-                raise e
-
-    async def check_model_exists(self, model_path: str) -> bool:
-        """Verifica si el modelo ya existe localmente"""
-        try:
-            path = Path(model_path)
-            if path.exists() and path.stat().st_size > 0:
-                logger.info(f"Modelo encontrado localmente: {model_path}")
-                return True
-            return False
-        except Exception as e:
-            logger.error(f"Error verificando modelo: {e}")
-            return False
-
-# ============================================================================
-# Servidor Llama.cpp
-# ============================================================================
-
-@dataclass
-class LlamaServerConfig:
-    gpu_id: int
-    port: int
-    model_path: Path
-    context_size: int
-    parallel_requests: int
-    batch_size: int
-    max_tokens: int
-
-class LlamaServerManager:
-    """Gestiona instancias de servidores llama.cpp en múltiples GPUs"""
+            print(f"Error cargando modelo: {e}")
+            print("Usando modelo mock para demostración")
     
-    def __init__(self, server_binary: str = "./server"):
-        self.server_binary = server_binary
-        self.servers: Dict[int, subprocess.Popen] = {}
-        self.configs: Dict[int, LlamaServerConfig] = {}
-        self.base_port = 8080
-        self._server_ready = {}
-        
-    def get_server_port(self, gpu_id: int) -> Optional[int]:
-        """Obtiene el puerto de un servidor dado su gpu_id"""
-        config = self.configs.get(gpu_id)
-        return config.port if config else None
-    
-    def _verify_server_binary(self) -> bool:
-        """Verifica si el binario del servidor existe y es ejecutable"""
-        server_path = Path(self.server_binary)
-        if not server_path.exists():
-            logger.error(f"Binario del servidor no encontrado: {self.server_binary}")
-            logger.error("Sugerencias:")
-            logger.error("1. Clona llama.cpp: git clone https://github.com/ggerganov/llama.cpp.git")
-            logger.error("2. Compila: cd llama.cpp && make server LLAMA_CUDA=1")
-            logger.error("3. Copia server a la raíz del proyecto y hazlo ejecutable: chmod +x server")
-            return False
-        if not os.access(server_path, os.X_OK):
-            logger.error(f"Binario del servidor no es ejecutable: {self.server_binary}")
-            logger.error(f"Ejecuta: chmod +x {self.server_binary}")
-            return False
-        logger.info(f"✅ Binario del servidor verificado: {self.server_binary}")
-        return True
-    
-    def _check_port_available(self, port: int) -> bool:
-        """Verifica si el puerto está disponible"""
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            try:
-                s.bind(("0.0.0.0", port))
-                return True
-            except socket.error:
-                logger.error(f"Puerto {port} ya está en uso")
-                return False
-    
-    async def start_server(self, config: LlamaServerConfig) -> bool:
-        """Inicia un servidor llama.cpp en una GPU específica"""
-        gpu_id = config.gpu_id
-        
-        if gpu_id in self.servers:
-            process = self.servers[gpu_id]
-            if process.poll() is None:
-                logger.warning(f"Servidor ya corriendo en GPU {gpu_id}")
-                return True
-            else:
-                logger.warning(f"Limpiando servidor muerto en GPU {gpu_id}")
-                del self.servers[gpu_id]
-                if gpu_id in self.configs:
-                    del self.configs[gpu_id]
-                if gpu_id in self._server_ready:
-                    del self._server_ready[gpu_id]
-        
-        if not self._verify_server_binary():
-            return False
-        
-        if not self._check_port_available(config.port):
-            logger.error(f"No se puede iniciar servidor en GPU {gpu_id}: puerto {config.port} ocupado")
-            return False
-        
-        env = os.environ.copy()
-        env['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-        
-        cmd = [
-            self.server_binary,
-            "-m", str(config.model_path),
-            "--host", "0.0.0.0",
-            "--port", str(config.port),
-            "-c", str(config.context_size),
-            "-np", str(config.parallel_requests),
-            "-b", str(config.batch_size),
-            "-ngl", "-1",
-            "--threads", "8",
-            "-v"
-        ]
-        
-        logger.info(f"Iniciando servidor GPU {gpu_id}: {' '.join(cmd)}")
+    def generate_batch(self, texts: List[str], max_lengths: List[int], 
+                      temperatures: List[float]) -> List[str]:
+        """Genera respuestas en batch"""
+        if self.model is None or self.tokenizer is None:
+            # Mock generation para demostración
+            return [f"Respuesta generada para: {text[:50]}..." for text in texts]
         
         try:
-            log_dir = Path("./logs")
-            log_dir.mkdir(exist_ok=True)
+            # Tokenizar el batch
+            inputs = self.tokenizer(
+                texts, 
+                return_tensors="pt", 
+                padding=True, 
+                truncation=True,
+                max_length=512
+            ).to(self.device)
             
-            stdout_file = open(log_dir / f"llama_gpu_{gpu_id}_stdout.log", "w")
-            stderr_file = open(log_dir / f"llama_gpu_{gpu_id}_stderr.log", "w")
+            # Generar respuestas
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max(max_lengths),
+                    temperature=max(temperatures),
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.eos_token_id
+                )
             
-            process = subprocess.Popen(
-                cmd,
-                env=env,
-                stdout=stdout_file,
-                stderr=stderr_file,
-                text=True
-            )
+            # Decodificar respuestas
+            responses = []
+            for i, output in enumerate(outputs):
+                # Obtener solo los tokens nuevos
+                input_length = inputs.input_ids[i].shape[0]
+                generated = output[input_length:]
+                response = self.tokenizer.decode(generated, skip_special_tokens=True)
+                responses.append(response)
             
-            self.servers[gpu_id] = process
-            self.configs[gpu_id] = config
-            self._server_ready[gpu_id] = False
-            
-            await asyncio.sleep(3)
-            
-            if process.poll() is not None:
-                logger.error(f"Servidor GPU {gpu_id} falló al iniciar (exit code: {process.returncode})")
-                logger.error(f"Check logs: ./logs/llama_gpu_{gpu_id}_*.log")
-                
-                stdout_file.close()
-                stderr_file.close()
-                if gpu_id in self.servers:
-                    del self.servers[gpu_id]
-                if gpu_id in self.configs:
-                    del self.configs[gpu_id]
-                if gpu_id in self._server_ready:
-                    del self._server_ready[gpu_id]
-                    
-                return False
-            
-            await self._wait_for_server_improved(config.port, gpu_id)
-            self._server_ready[gpu_id] = True
-            logger.info(f"✅ Servidor GPU {gpu_id} listo en puerto {config.port}")
-            return True
+            return responses
             
         except Exception as e:
-            logger.error(f"Error iniciando servidor GPU {gpu_id}: {e}")
-            logger.error(f"Comando ejecutado: {' '.join(cmd)}")
-            logger.error(f"Check logs: ./logs/llama_gpu_{gpu_id}_*.log")
-            
-            if gpu_id in self.servers:
-                process = self.servers[gpu_id]
-                if process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait()
-                
-                del self.servers[gpu_id]
-                if gpu_id in self.configs:
-                    del self.configs[gpu_id]
-                if gpu_id in self._server_ready:
-                    del self._server_ready[gpu_id]
-            
-            stdout_file.close()
-            stderr_file.close()
-            return False
-    
-    def get_available_servers(self) -> List[int]:
-        """Obtiene lista de servidores con procesos vivos y marcados como listos"""
-        active_servers = []
-        dead_servers = []
-        
-        for gpu_id, process in self.servers.items():
-            try:
-                # Verificar si el proceso está realmente vivo
-                proc = psutil.Process(process.pid)
-                if proc.is_running() and self._server_ready.get(gpu_id, False):
-                    active_servers.append(gpu_id)
-                    logger.debug(f"Servidor GPU {gpu_id} (PID {process.pid}) está vivo y listo")
-                else:
-                    dead_servers.append(gpu_id)
-                    logger.warning(f"Servidor GPU {gpu_id} (PID {process.pid}) no está listo o murió")
-            except psutil.NoSuchProcess:
-                dead_servers.append(gpu_id)
-                logger.warning(f"Servidor GPU {gpu_id} (PID {process.pid}) no existe")
-            except Exception as e:
-                logger.error(f"Error verificando servidor GPU {gpu_id}: {e}")
-                dead_servers.append(gpu_id)
-        
-        for gpu_id in dead_servers:
-            logger.warning(f"Removiendo servidor muerto GPU {gpu_id}")
-            if gpu_id in self.servers:
-                del self.servers[gpu_id]
-            if gpu_id in self.configs:
-                del self.configs[gpu_id]
-            if gpu_id in self._server_ready:
-                del self._server_ready[gpu_id]
-        
-        logger.info(f"Servidores activos: {active_servers}")
-        return active_servers
-    
-    async def _wait_for_server_improved(self, port: int, gpu_id: int, timeout: int = 600):
-        """Espera a que el servidor esté listo con mejor manejo de errores"""
-        start_time = time.time()
-        last_error = None
-        
-        test_endpoints = ["/health", "/v1/models", "/props", "/"]
-        
-        logger.info(f"Esperando servidor GPU {gpu_id} en puerto {port}...")
-        
-        while time.time() - start_time < timeout:
-            process = self.servers.get(gpu_id)
-            if process and process.poll() is not None:
-                logger.error(f"Proceso del servidor GPU {gpu_id} murió durante inicialización (exit code: {process.returncode})")
-                logger.error(f"Check logs: ./logs/llama_gpu_{gpu_id}_*.log")
-                raise RuntimeError(f"Proceso del servidor GPU {gpu_id} falló")
-            
-            for endpoint in test_endpoints:
-                try:
-                    async with httpx.AsyncClient(timeout=10.0) as client:  # Increased timeout
-                        response = await client.get(f"http://127.0.0.1:{port}{endpoint}")
-                        if response.status_code in [200, 404, 405]:
-                            logger.info(f"✅ Servidor GPU {gpu_id} respondiendo en {endpoint} (status: {response.status_code})")
-                            return
-                        else:
-                            logger.debug(f"GPU {gpu_id} endpoint {endpoint} returned {response.status_code}")
-                except Exception as e:
-                    last_error = e
-                    logger.debug(f"Connection attempt failed for GPU {gpu_id} {endpoint}: {e}")
-                    continue
-            
-            logger.debug(f"Waiting for GPU {gpu_id} server... ({time.time() - start_time:.1f}s)")
-            await asyncio.sleep(3)
-        
-        logger.error(f"❌ Timeout esperando servidor GPU {gpu_id} en puerto {port}")
-        logger.error(f"Último error: {last_error}")
-        logger.error(f"Check logs: ./logs/llama_gpu_{gpu_id}_*.log")
-        
-        process = self.servers.get(gpu_id)
-        if process and process.poll() is not None:
-            logger.error(f"Process exit code: {process.returncode}")
-        
-        raise TimeoutError(f"Servidor en puerto {port} no respondió en {timeout}s")
-    
-    def stop_all_servers(self):
-        """Detiene todos los servidores"""
-        for gpu_id, process in self.servers.items():
-            logger.info(f"Deteniendo servidor GPU {gpu_id}")
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    logger.warning(f"Forzando terminación del servidor GPU {gpu_id}")
-                    process.kill()
-                    process.wait()
-        
-        self.servers.clear()
-        self.configs.clear()
-        self._server_ready.clear()
+            print(f"Error en generación: {e}")
+            return [f"Error generando respuesta para: {text[:50]}..." for text in texts]
 
-# ============================================================================
-# Load Balancer
-# ============================================================================
-
-class LoadBalancer:
-    """Distribuye requests entre servidores disponibles"""
-    
-    def __init__(self, server_manager: LlamaServerManager):
-        self.server_manager = server_manager
-        self.current_server = 0
-        self.server_stats = {}
-        self._last_health_check = {}
-    
-    async def _check_server_health(self, gpu_id: int) -> bool:
-        """Verifica si un servidor específico está respondiendo"""
-        port = self.server_manager.get_server_port(gpu_id)
-        if not port:
-            logger.error(f"No se encontró puerto para GPU {gpu_id}")
-            return False
+class BatchProcessor:
+    def __init__(self, model_manager: ModelManager, batch_size: int = 4, 
+                 max_wait_time: float = 0.5):
+        self.model_manager = model_manager
+        self.batch_size = batch_size
+        self.max_wait_time = max_wait_time
+        self.queue = deque()
+        self.processing = False
+        self.lock = threading.Lock()
         
-        now = time.time()
-        if gpu_id in self._last_health_check:
-            if now - self._last_health_check[gpu_id] < 5:
-                logger.debug(f"Health check cacheado para GPU {gpu_id}: True")
-                return True
+    async def add_request(self, item: QueueItem):
+        """Añade un request a la cola"""
+        with self.lock:
+            self.queue.append(item)
+        
+        # Iniciar procesamiento si no está corriendo
+        if not self.processing:
+            asyncio.create_task(self.process_queue())
+    
+    async def process_queue(self):
+        """Procesa la cola en batches"""
+        if self.processing:
+            return
+            
+        self.processing = True
         
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:  # Increased timeout
-                for endpoint in ["/health", "/v1/models", "/props"]:
-                    try:
-                        response = await client.get(f"http://127.0.0.1:{port}{endpoint}")
-                        if response.status_code in [200, 404]:
-                            logger.debug(f"Health check exitoso para GPU {gpu_id} en {endpoint} (status: {response.status_code})")
-                            self._last_health_check[gpu_id] = now
-                            return True
-                        else:
-                            logger.debug(f"Health check falló para GPU {gpu_id} en {endpoint}: status {response.status_code}")
-                    except Exception as e:
-                        logger.debug(f"Health check falló para GPU {gpu_id} en {endpoint}: {e}")
-                        continue
-                logger.error(f"Todos los endpoints de health check fallaron para GPU {gpu_id}")
-                return False
-        except Exception as e:
-            logger.error(f"Error en health check para GPU {gpu_id}: {e}")
-            return False
+            while True:
+                # Esperar hasta tener requests o timeout
+                start_wait = time.time()
+                while len(self.queue) == 0 and (time.time() - start_wait) < self.max_wait_time:
+                    await asyncio.sleep(0.01)
+                
+                if len(self.queue) == 0:
+                    break
+                
+                # Extraer batch
+                batch_items = []
+                with self.lock:
+                    for _ in range(min(self.batch_size, len(self.queue))):
+                        if self.queue:
+                            batch_items.append(self.queue.popleft())
+                
+                if not batch_items:
+                    break
+                
+                # Procesar batch
+                await self.process_batch(batch_items)
+                
+        finally:
+            self.processing = False
     
-    async def get_available_servers(self) -> List[int]:
-        """Obtiene servidores que están realmente disponibles"""
-        running_servers = self.server_manager.get_available_servers()
-        
-        if not running_servers:
-            logger.warning("No running server processes found")
-            return []
-        
-        available_servers = []
-        health_checks = await asyncio.gather(
-            *[self._check_server_health(gpu_id) for gpu_id in running_servers],
-            return_exceptions=True
-        )
-        
-        for gpu_id, is_healthy in zip(running_servers, health_checks):
-            if is_healthy is True:
-                available_servers.append(gpu_id)
-                logger.debug(f"Servidor GPU {gpu_id} marcado como disponible")
-            elif isinstance(is_healthy, Exception):
-                logger.error(f"Excepción en health check para GPU {gpu_id}: {is_healthy}")
-            else:
-                logger.warning(f"Servidor GPU {gpu_id} no responde a health checks")
-        
-        logger.info(f"Servidores disponibles después de health checks: {available_servers}")
-        return available_servers
-    
-    async def get_next_server(self) -> Optional[int]:
-        """Obtiene el próximo servidor usando round-robin"""
-        available_servers = await self.get_available_servers()
-        
-        if not available_servers:
-            logger.error("No available servers found")
-            running_servers = self.server_manager.get_available_servers()
-            logger.error(f"Running processes: {running_servers}")
-            for gpu_id in running_servers:
-                port = self.server_manager.get_server_port(gpu_id)
-                logger.error(f"GPU {gpu_id} -> Port {port}")
-            return None
-        
-        if self.current_server >= len(available_servers):
-            self.current_server = 0
-            
-        gpu_id = available_servers[self.current_server]
-        self.current_server += 1
-        
-        logger.debug(f"Seleccionado servidor GPU {gpu_id} (round-robin)")
-        return gpu_id
-    
-    async def get_best_server(self) -> Optional[int]:
-        """Obtiene el servidor con mejor rendimiento"""
-        available_servers = await self.get_available_servers()
-        
-        if not available_servers:
-            logger.error("No hay servidores disponibles para seleccionar")
-            return None
-        
-        if not any(server in self.server_stats for server in available_servers):
-            return await self.get_next_server()
-        
-        best_server = min(
-            available_servers,
-            key=lambda s: self.server_stats.get(s, {"requests": 0})["requests"]
-        )
-        
-        logger.debug(f"Seleccionado mejor servidor GPU {best_server}")
-        return best_server
-    
-    def update_server_stats(self, gpu_id: int, processing_time: float):
-        """Actualiza estadísticas de un servidor"""
-        if gpu_id not in self.server_stats:
-            self.server_stats[gpu_id] = {"requests": 0, "avg_time": 0.0}
-        
-        stats = self.server_stats[gpu_id]
-        stats["requests"] += 1
-        
-        alpha = 0.1
-        if stats["avg_time"] == 0:
-            stats["avg_time"] = processing_time
-        else:
-            stats["avg_time"] = alpha * processing_time + (1 - alpha) * stats["avg_time"]
-
-# ============================================================================
-# Cliente Llama.cpp
-# ============================================================================
-
-class LlamaClient:
-    """Cliente para comunicarse con servidores llama.cpp"""
-
-    def __init__(self, load_balancer: LoadBalancer, host: str = "127.0.0.1"):
-        self.load_balancer = load_balancer
-        self.host = host
-        self.session = None
-    
-    async def __aenter__(self):
-        self.session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=300)
-        )
-        return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.session:
-            await self.session.close()
-    
-    async def generate_completion(self, request: CompletionRequest) -> Dict[str, Any]:
-        """Genera una completion usando el mejor servidor disponible"""
-        gpu_id = await self.load_balancer.get_best_server()
-        
-        if gpu_id is None:
-            running_servers = self.load_balancer.server_manager.get_available_servers()
-            available_servers = await self.load_balancer.get_available_servers()
-            
-            error_msg = f"No hay servidores disponibles. "
-            error_msg += f"Procesos ejecutándose: {running_servers}, "
-            error_msg += f"Servidores respondiendo: {available_servers}"
-            
-            logger.error(error_msg)
-            raise HTTPException(status_code=503, detail=error_msg)
-        
-        port = self.load_balancer.server_manager.get_server_port(gpu_id)
-        url = f"http://{self.host}:{port}/completion"
-        
-        payload = {
-            "prompt": request.prompt,
-            "n_predict": request.max_tokens,
-            "temperature": request.temperature,
-            "top_p": request.top_p,
-            "top_k": request.top_k,
-            "repeat_penalty": request.repeat_penalty,
-            "stop": request.stop or [],
-            "stream": request.stream
-        }
+    async def process_batch(self, batch_items: List[QueueItem]):
+        """Procesa un batch de requests"""
+        if not batch_items:
+            return
         
         start_time = time.time()
         
+        # Extraer datos del batch
+        texts = [item.text for item in batch_items]
+        max_lengths = [item.max_length for item in batch_items]
+        temperatures = [item.temperature for item in batch_items]
+        
+        # Generar respuestas
         try:
-            logger.debug(f"Enviando request a GPU {gpu_id} (puerto {port})")
-            async with self.session.post(url, json=payload) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    logger.error(f"Error del servidor GPU {gpu_id}: {response.status} - {error_text}")
-                    raise HTTPException(
-                        status_code=response.status,
-                        detail=f"Error del servidor GPU {gpu_id}: {error_text}"
+            responses = self.model_manager.generate_batch(texts, max_lengths, temperatures)
+            processing_time = time.time() - start_time
+            
+            # Enviar respuestas a los futures
+            for item, response in zip(batch_items, responses):
+                if not item.future.done():
+                    result = InferenceResponse(
+                        request_id=item.request_id,
+                        generated_text=response,
+                        processing_time=processing_time
                     )
-                
-                result = await response.json()
-                processing_time = time.time() - start_time
-                
-                self.load_balancer.update_server_stats(gpu_id, processing_time)
-                
-                result["gpu_id"] = gpu_id
-                result["processing_time"] = processing_time
-                
-                logger.debug(f"✅ Completion exitosa en GPU {gpu_id} ({processing_time:.2f}s)")
-                return result
-                
+                    item.future.set_result(result)
+                    
         except Exception as e:
-            logger.error(f"Error comunicándose con servidor GPU {gpu_id}: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+            # Manejar errores
+            for item in batch_items:
+                if not item.future.done():
+                    item.future.set_exception(e)
 
-# ============================================================================
-# Gestor de Embeddings
-# ============================================================================
-
-class EmbeddingManager:
-    """Gestiona modelos de embeddings en CPU"""
-    
-    def __init__(self):
-        self.models: Dict[str, SentenceTransformer] = {}
-        self.device = "cpu"
-        
-    async def load_model(self, model_name: str) -> SentenceTransformer:
-        """Carga un modelo de embeddings"""
-        if model_name not in self.models:
-            logger.info(f"Cargando modelo de embeddings: {model_name}")
-            
-            torch.set_num_threads(4)
-            
-            model = SentenceTransformer(model_name, device=self.device)
-            self.models[model_name] = model
-            
-            logger.info(f"Modelo {model_name} cargado en CPU")
-        
-        return self.models[model_name]
-    
-    async def generate_embedding(self, text: str, model_name: str = "all-MiniLM-L6-v2") -> List[float]:
-        """Genera embeddings para un texto"""
-        model = await self.load_model(model_name)
-        
-        loop = asyncio.get_event_loop()
-        embedding = await loop.run_in_executor(
-            None, 
-            lambda: model.encode(text, convert_to_tensor=False).tolist()
-        )
-        
-        return embedding
-
-# ============================================================================
-# Aplicación FastAPI
-# ============================================================================
-
-gpu_manager = GPUManager()
-model_downloader = ModelDownloader()
-server_manager = LlamaServerManager()
-load_balancer = LoadBalancer(server_manager)
-embedding_manager = EmbeddingManager()
+# Variables globales
+model_manager = None
+batch_processor = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Gestión del ciclo de vida de la aplicación"""
-    logger.info("Iniciando sistema Multi-GPU Llama.cpp")
+    """Manejo del ciclo de vida de la aplicación"""
+    global model_manager, batch_processor
     
-    args = app.state.args
+    # Startup
+    print("Iniciando sistema de inferencia...")
+    model_manager = ModelManager()
+    model_manager.load_model()
+    batch_processor = BatchProcessor(model_manager, batch_size=4, max_wait_time=0.5)
+    print("Sistema listo!")
     
-    try:
-        logger.info(f"Descargando modelo: {args.repo_id}/{args.model_filename}")
-        model_path = await model_downloader.download_model(args.repo_id, args.model_filename)
-        
-        gpu_manager.refresh_gpu_info()
-        available_gpus = gpu_manager.get_available_gpus(args.min_vram_gb)
-        
-        if not available_gpus:
-            logger.error("No hay GPUs disponibles con suficiente VRAM")
-            sys.exit(1)
-        
-        logger.info(f"GPUs disponibles: {available_gpus}")
-        
-        tasks = []
-        for i, gpu_id in enumerate(available_gpus[:args.max_gpus]):
-            port = 8080 + i
-            config = LlamaServerConfig(
-                gpu_id=gpu_id,
-                port=port,
-                model_path=model_path,
-                context_size=args.context_size,
-                parallel_requests=args.parallel_requests,
-                batch_size=args.batch_size,
-                max_tokens=args.max_output_tokens
-            )
-            
-            task = server_manager.start_server(config)
-            tasks.append(task)
-        
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        successful_servers = sum(1 for r in results if r is True)
-        
-        if successful_servers == 0:
-            logger.error("No se pudo iniciar ningún servidor")
-            for i, result in enumerate(results):
-                if isinstance(result, Exception):
-                    logger.error(f"Error iniciando servidor GPU {available_gpus[i]}: {result}")
-            sys.exit(1)
-        
-        logger.info(f"✅ {successful_servers} servidores iniciados correctamente")
-        
-        logger.info(f"Precargando modelo de embeddings: {args.embedding_model}")
-        await embedding_manager.load_model(args.embedding_model)
-        
-        logger.info("Sistema listo para recibir requests")
-        
-        yield
-        
-    finally:
-        logger.info("Deteniendo sistema...")
-        server_manager.stop_all_servers()
-        logger.info("Sistema detenido correctamente")
+    yield
+    
+    # Shutdown
+    print("Cerrando sistema...")
 
+# Crear aplicación FastAPI
 app = FastAPI(
-    title="Multi-GPU Llama.cpp API",
-    description="API distribuida para inferencia con Llama.cpp en múltiples GPUs",
+    title="Unsloth Batch Inference API",
+    description="API de inferencia con batching usando Unsloth y colas",
     version="1.0.0",
     lifespan=lifespan
 )
 
-# ============================================================================
-# Endpoints de la API
-# ============================================================================
+@app.post("/generate", response_model=InferenceResponse)
+async def generate_text(request: InferenceRequest):
+    """Endpoint principal para generación de texto"""
+    if batch_processor is None:
+        raise HTTPException(status_code=503, detail="Modelo no disponible")
+    
+    # Generar ID único si no se proporciona
+    request_id = request.request_id or str(uuid.uuid4())
+    
+    # Crear future para la respuesta
+    future = asyncio.Future()
+    
+    # Crear item de cola
+    queue_item = QueueItem(
+        request_id=request_id,
+        text=request.text,
+        max_length=request.max_length or 100,
+        temperature=request.temperature or 0.7,
+        timestamp=time.time(),
+        future=future
+    )
+    
+    # Añadir a la cola
+    await batch_processor.add_request(queue_item)
+    
+    # Esperar respuesta con timeout
+    try:
+        result = await asyncio.wait_for(future, timeout=30.0)
+        return result
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=408, detail="Timeout en la generación")
 
 @app.get("/health")
 async def health_check():
-    """Health check del sistema"""
-    servers = server_manager.get_available_servers()
-    gpu_manager.refresh_gpu_info()
-    
+    """Endpoint de salud"""
+    queue_size = len(batch_processor.queue) if batch_processor else 0
     return {
         "status": "healthy",
-        "servers_active": len(servers),
-        "gpus_detected": len(gpu_manager.gpus),
-        "server_stats": load_balancer.server_stats
+        "model_loaded": model_manager is not None and model_manager.model is not None,
+        "queue_size": queue_size,
+        "processing": batch_processor.processing if batch_processor else False
     }
-
-@app.post("/v1/completions", response_model=CompletionResponse)
-async def create_completion(request: CompletionRequest):
-    if request.stream:
-        return StreamingResponse(
-            stream_completion(request),
-            media_type="text/event-stream"
-        )
-    
-    async with LlamaClient(load_balancer, host="127.0.0.1") as client:
-        result = await client.generate_completion(request)
-        
-        return CompletionResponse(
-            id=f"cmpl-{int(time.time())}",
-            created=int(time.time()),
-            choices=[{
-                "text": result["content"],
-                "index": 0,
-                "finish_reason": "stop" if result.get("stopped_eos") else "length",
-                "metadata": {
-                    "gpu_id": result.get("gpu_id"),
-                    "processing_time": result.get("processing_time"),
-                    "tokens_predicted": result.get("tokens_predicted", 0)
-                }
-            }],
-            usage={
-                "prompt_tokens": result.get("tokens_evaluated", 0),
-                "completion_tokens": result.get("tokens_predicted", 0),
-                "total_tokens": result.get("tokens_evaluated", 0) + result.get("tokens_predicted", 0)
-            }
-        )
-
-async def stream_completion(request: CompletionRequest):
-    """Stream de completion"""
-    async with LlamaClient(load_balancer) as client:
-        try:
-            async for chunk in client.generate_completion_stream(request):
-                yield chunk
-        except AttributeError:
-            result = await client.generate_completion(request)
-            yield f"data: {json.dumps(result)}\n\n"
-        yield "data: [DONE]\n\n"
-
-@app.post("/v1/chat/completions")
-async def create_chat_completion(request: ChatCompletionRequest):
-    """Genera respuesta de chat"""
-    prompt = messages_to_prompt(request.messages)
-    
-    completion_request = CompletionRequest(
-        prompt=prompt,
-        max_tokens=request.max_tokens,
-        temperature=request.temperature,
-        top_p=request.top_p,
-        top_k=request.top_k,
-        repeat_penalty=request.repeat_penalty,
-        stop=request.stop,
-        stream=request.stream
-    )
-    
-    if request.stream:
-        return StreamingResponse(
-            stream_completion(completion_request),
-            media_type="text/event-stream"
-        )
-    
-    return await create_completion(completion_request)
-
-def messages_to_prompt(messages: List[ChatMessage]) -> str:
-    """Convierte mensajes de chat a prompt"""
-    prompt_parts = []
-    
-    for message in messages:
-        if message.role == "system":
-            prompt_parts.append(f"System: {message.content}")
-        elif message.role == "user":
-            prompt_parts.append(f"User: {message.content}")
-        elif message.role == "assistant":
-            prompt_parts.append(f"Assistant: {message.content}")
-    
-    prompt_parts.append("Assistant:")
-    return "\n".join(prompt_parts)
-
-@app.post("/v1/embeddings", response_model=EmbeddingResponse)
-async def create_embeddings(request: EmbeddingRequest):
-    """Genera embeddings de texto"""
-    try:
-        embedding = await embedding_manager.generate_embedding(
-            request.input, 
-            request.model
-        )
-        
-        return EmbeddingResponse(
-            data=[{
-                "object": "embedding",
-                "index": 0,
-                "embedding": embedding
-            }],
-            usage={
-                "prompt_tokens": len(request.input.split()),
-                "total_tokens": len(request.input.split())
-            }
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generando embeddings: {str(e)}")
 
 @app.get("/stats")
-async def get_system_stats():
+async def get_stats():
     """Estadísticas del sistema"""
-    gpu_manager.refresh_gpu_info()
+    if batch_processor is None:
+        return {"error": "Sistema no inicializado"}
     
     return {
-        "gpus": [
-            {
-                "id": gpu.id,
-                "name": gpu.name,
-                "memory_total_gb": round(gpu.memory_total / 1024, 2),
-                "memory_free_gb": round(gpu.memory_free / 1024, 2),
-                "memory_used_gb": round((gpu.memory_total - gpu.memory_free) / 1024, 2),
-                "utilization": gpu.utilization,
-                "temperature": gpu.temperature
-            }
-            for gpu in gpu_manager.gpus
-        ],
-        "servers": [
-            {
-                "gpu_id": gpu_id,
-                "port": server_manager.get_server_port(gpu_id),
-                "stats": load_balancer.server_stats.get(gpu_id, {})
-            }
-            for gpu_id in server_manager.get_available_servers()
-        ],
-        "system": {
-            "cpu_percent": psutil.cpu_percent(),
-            "memory_percent": psutil.virtual_memory().percent,
-            "memory_used_gb": round(psutil.virtual_memory().used / (1024**3), 2)
-        }
+        "queue_size": len(batch_processor.queue),
+        "batch_size": batch_processor.batch_size,
+        "max_wait_time": batch_processor.max_wait_time,
+        "is_processing": batch_processor.processing,
+        "model_name": model_manager.model_name if model_manager else "Unknown"
     }
-
-@app.get("/debug/servers")
-async def debug_servers():
-    """Endpoint de debug para verificar estado de servidores"""
-    running_servers = server_manager.get_available_servers()
-    available_servers = await load_balancer.get_available_servers()
-    
-    server_details = []
-    for gpu_id in server_manager.servers.keys():
-        process = server_manager.servers[gpu_id]
-        config = server_manager.configs.get(gpu_id)
-        
-        server_details.append({
-            "gpu_id": gpu_id,
-            "port": config.port if config else None,
-            "process_alive": process.poll() is None,
-            "process_pid": process.pid,
-            "ready_flag": server_manager._server_ready.get(gpu_id, False),
-            "in_running_list": gpu_id in running_servers,
-            "in_available_list": gpu_id in available_servers,
-            "stats": load_balancer.server_stats.get(gpu_id, {})
-        })
-    
-    return {
-        "running_servers": running_servers,
-        "available_servers": available_servers,
-        "server_details": server_details,
-        "load_balancer_stats": load_balancer.server_stats
-    }
-
-# ============================================================================
-# CLI y Main
-# ============================================================================
-
-def parse_arguments():
-    """Parsea argumentos de línea de comandos"""
-    parser = argparse.ArgumentParser(
-        description="Sistema Multi-GPU Llama.cpp con FastAPI"
-    )
-    
-    parser.add_argument(
-        "--repo-id",
-        default="unsloth/Qwen2.5-Coder-32B-Instruct-GGUF",
-        help="Repositorio de HuggingFace del modelo"
-    )
-    parser.add_argument(
-        "--model-filename",
-        default="Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf",
-        help="Nombre del archivo del modelo GGUF"
-    )
-    parser.add_argument(
-        "--server-binary",
-        default="./server",
-        help="Ruta al binario del servidor llama.cpp"
-    )
-    parser.add_argument(
-        "--context-size",
-        type=int,
-        default=32768,
-        help="Tamaño del contexto en tokens (32k por defecto)"
-    )
-    parser.add_argument(
-        "--max-output-tokens",
-        type=int,
-        default=4096,
-        help="Máximo tokens de salida"
-    )
-    parser.add_argument(
-        "--parallel-requests",
-        type=int,
-        default=2,
-        help="Requests paralelos por GPU"
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=512,
-        help="Tamaño del batch"
-    )
-    parser.add_argument(
-        "--max-gpus",
-        type=int,
-        default=8,
-        help="Máximo número de GPUs a usar"
-    )
-    parser.add_argument(
-        "--min-vram-gb",
-        type=float,
-        default=18.0,
-        help="VRAM mínima requerida por GPU (GB)"
-    )
-    parser.add_argument(
-        "--gpu-ids",
-        type=str,
-        help="IDs específicos de GPUs a usar (ej: 0,1,2)"
-    )
-    parser.add_argument(
-        "--embedding-model",
-        default="all-MiniLM-L6-v2",
-        help="Modelo de embeddings para CPU"
-    )
-    parser.add_argument(
-        "--embedding-threads",
-        type=int,
-        default=4,
-        help="Threads para embeddings en CPU"
-    )
-    parser.add_argument(
-        "--host",
-        default="0.0.0.0",
-        help="Host para la API"
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=3000,
-        help="Puerto para la API"
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=1,
-        help="Workers de Uvicorn"
-    )
-    parser.add_argument(
-        "--log-level",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        default="INFO",
-        help="Nivel de logging"
-    )
-    parser.add_argument(
-        "--log-file",
-        help="Archivo de log (opcional)"
-    )
-    parser.add_argument(
-        "--models-dir",
-        default="./models",
-        help="Directorio para modelos descargados"
-    )
-    parser.add_argument(
-        "--force-download",
-        action="store_true",
-        help="Forzar descarga del modelo aunque exista"
-    )
-    
-    return parser.parse_args()
-
-def setup_logging(args):
-    """Configura el sistema de logging"""
-    level = getattr(logging, args.log_level)
-    
-    handlers = [logging.StreamHandler()]
-    
-    if args.log_file:
-        handlers.append(logging.FileHandler(args.log_file))
-    
-    logging.basicConfig(
-        level=level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=handlers
-    )
-
-def setup_signal_handlers():
-    """Configura manejadores de señales para shutdown graceful"""
-    def signal_handler(sig, frame):
-        logger.info(f"Recibida señal {sig}, deteniendo servidores...")
-        server_manager.stop_all_servers()
-        sys.exit(0)
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-async def validate_environment(args):
-    """Valida que el entorno esté correctamente configurado"""
-    errors = []
-    warnings = []
-    
-    server_path = Path(args.server_binary)
-    if not server_path.exists():
-        errors.append(f"Binario del servidor no encontrado: {args.server_binary}")
-        logger.error("Sugerencias para resolver problema del servidor:")
-        logger.error("1. Clona llama.cpp: git clone https://github.com/ggerganov/llama.cpp.git")
-        logger.error("2. Compila: cd llama.cpp && make server LLAMA_CUDA=1")
-        logger.error("3. Usa --server-binary para especificar ruta correcta")
-    elif not os.access(server_path, os.X_OK):
-        errors.append(f"Binario del servidor no es ejecutable: {args.server_binary}")
-        logger.error(f"Ejecuta: chmod +x {args.server_binary}")
-    else:
-        logger.info(f"✅ Binario del servidor encontrado: {args.server_binary}")
-    
-    try:
-        result = subprocess.run(["nvidia-smi"], capture_output=True, check=True, timeout=10)
-        logger.info("✅ nvidia-smi disponible")
-    except subprocess.TimeoutExpired:
-        warnings.append("nvidia-smi timeout - GPU monitoring limitado")
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        warnings.append("nvidia-smi no disponible - usando detección CUDA alternativa")
-    
-    cuda_available = False
-    try:
-        import torch
-        cuda_available = torch.cuda.is_available()
-        if cuda_available:
-            gpu_count = torch.cuda.device_count()
-            logger.info(f"✅ CUDA disponible - {gpu_count} GPU(s) detectadas")
-            
-            for i in range(gpu_count):
-                props = torch.cuda.get_device_properties(i)
-                memory_gb = props.total_memory / (1024**3)
-                logger.info(f"   GPU {i}: {props.name} - {memory_gb:.1f}GB VRAM")
-        else:
-            warnings.append("CUDA no está disponible en PyTorch")
-    except ImportError:
-        warnings.append("PyTorch no instalado (requerido para detección CUDA y embeddings)")
-    
-    gpu_manager.refresh_gpu_info()
-    available_gpus = gpu_manager.get_available_gpus(args.min_vram_gb)
-    
-    if not available_gpus and not cuda_available:
-        errors.append(f"No hay GPUs detectadas o disponibles")
-    elif not available_gpus and cuda_available:
-        warnings.append(f"GPUs detectadas pero ninguna con {args.min_vram_gb}GB VRAM libre")
-        logger.warning("Continuando con todas las GPUs disponibles...")
-    else:
-        logger.info(f"✅ {len(available_gpus)} GPU(s) disponibles con suficiente VRAM")
-    
-    try:
-        from sentence_transformers import SentenceTransformer
-        logger.info("✅ sentence-transformers disponible")
-        
-        try:
-            test_model = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
-            logger.info("✅ Embeddings funcionando correctamente")
-        except Exception as e:
-            warnings.append(f"Error cargando modelo de embeddings de prueba: {e}")
-            
-    except ImportError:
-        errors.append("sentence-transformers no instalado (pip install sentence-transformers)")
-    
-    required_modules = [
-        ('aiohttp', 'aiohttp'),
-        ('aiofiles', 'aiofiles'), 
-        ('fastapi', 'fastapi'),
-        ('uvicorn', 'uvicorn'),
-        ('httpx', 'httpx'),
-        ('huggingface_hub', 'huggingface-hub'),
-        ('psutil', 'psutil')
-    ]
-    
-    missing_modules = []
-    for module_name, pip_name in required_modules:
-        try:
-            __import__(module_name)
-        except ImportError:
-            missing_modules.append(pip_name)
-    
-    if missing_modules:
-        errors.append(f"Módulos faltantes: {', '.join(missing_modules)}")
-        logger.error(f"Instala con: pip install {' '.join(missing_modules)}")
-    
-    try:
-        models_path = Path(args.models_dir)
-        models_path.mkdir(exist_ok=True)
-        
-        statvfs = os.statvfs(models_path)
-        free_space_gb = (statvfs.f_frsize * statvfs.f_bavail) / (1024**3)
-        
-        if free_space_gb < 10:
-            warnings.append(f"Poco espacio libre para modelos: {free_space_gb:.1f}GB")
-        else:
-            logger.info(f"✅ Espacio disponible para modelos: {free_space_gb:.1f}GB")
-            
-    except Exception as e:
-        warnings.append(f"No se pudo verificar espacio en disco: {e}")
-    
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get("https://huggingface.co")
-            if response.status_code == 200:
-                logger.info("✅ Conectividad a Hugging Face OK")
-            else:
-                warnings.append("Problemas de conectividad a Hugging Face")
-    except Exception:
-        warnings.append("No se pudo verificar conectividad a Hugging Face")
-    
-    if warnings:
-        logger.warning("⚠️  Advertencias de configuración:")
-        for warning in warnings:
-            logger.warning(f"  - {warning}")
-        logger.warning("El sistema puede funcionar con limitaciones")
-    
-    if errors:
-        logger.error("❌ Errores de configuración críticos:")
-        for error in errors:
-            logger.error(f"  - {error}")
-        return False
-    
-    logger.info("✅ Validación del entorno completada exitosamente")
-    return True
-
-def print_startup_info(args):
-    """Imprime información de inicio del sistema"""
-    print("\n" + "="*80)
-    print("🚀 SISTEMA MULTI-GPU LLAMA.CPP API")
-    print("="*80)
-    print(f"📦 Modelo: {args.repo_id}/{args.model_filename}")
-    print(f"🖥️  Contexto: {args.context_size:,} tokens")
-    print(f"📤 Max output: {args.max_output_tokens:,} tokens")
-    print(f"🎯 GPUs máximas: {args.max_gpus}")
-    print(f"💾 VRAM mínima: {args.min_vram_gb}GB por GPU")
-    print(f"⚡ Requests paralelos: {args.parallel_requests} por GPU")
-    print(f"📊 Batch size: {args.batch_size}")
-    print(f"🧠 Embeddings: {args.embedding_model} (CPU)")
-    print(f"🌐 API: http://{args.host}:{args.port}")
-    print("="*80)
-    
-    gpu_manager.refresh_gpu_info()
-    available_gpus = gpu_manager.get_available_gpus(args.min_vram_gb)
-    
-    print(f"🎮 GPUs detectadas:")
-    for gpu in gpu_manager.gpus:
-        status = "✅ Disponible" if gpu.id in available_gpus else "❌ Insuficiente VRAM"
-        print(f"   GPU {gpu.id}: {gpu.name} - {gpu.memory_free/1024:.1f}GB libre - {status}")
-    
-    if available_gpus:
-        estimated_throughput = len(available_gpus[:args.max_gpus]) * args.parallel_requests
-        print(f"⚡ Throughput estimado: ~{estimated_throughput} requests simultáneos")
-    
-    print("="*80 + "\n")
-
-class HealthCheckServer:
-    """Servidor de health check independiente para monitoreo"""
-    
-    def __init__(self, port: int = 8080):
-        self.port = port
-        self.app = FastAPI(title="Health Check")
-        self.setup_routes()
-    
-    def setup_routes(self):
-        @self.app.get("/health")
-        async def health():
-            servers_active = len(server_manager.get_available_servers())
-            return {
-                "status": "healthy" if servers_active > 0 else "degraded",
-                "servers_active": servers_active,
-                "timestamp": int(time.time())
-            }
-        
-        @self.app.get("/metrics")
-        async def metrics():
-            """Métricas en formato Prometheus-like"""
-            gpu_manager.refresh_gpu_info()
-            
-            metrics = []
-            
-            for gpu in gpu_manager.gpus:
-                metrics.extend([
-                    f'gpu_memory_total_bytes{{gpu="{gpu.id}",name="{gpu.name}"}} {gpu.memory_total * 1024 * 1024}',
-                    f'gpu_memory_free_bytes{{gpu="{gpu.id}",name="{gpu.name}"}} {gpu.memory_free * 1024 * 1024}',
-                    f'gpu_utilization_percent{{gpu="{gpu.id}",name="{gpu.name}"}} {gpu.utilization}',
-                    f'gpu_temperature_celsius{{gpu="{gpu.id}",name="{gpu.name}"}} {gpu.temperature}'
-                ])
-            
-            for gpu_id in server_manager.get_available_servers():
-                stats = load_balancer.server_stats.get(gpu_id, {})
-                requests = stats.get("requests", 0)
-                avg_time = stats.get("avg_time", 0)
-                
-                metrics.extend([
-                    f'llama_requests_total{{gpu="{gpu_id}"}} {requests}',
-                    f'llama_avg_processing_time_seconds{{gpu="{gpu_id}"}} {avg_time}'
-                ])
-            
-            return "\n".join(metrics)
-
-def detect_environment():
-    """Detect if running in RunPod or similar container environment"""
-    if os.environ.get('RUNPOD_POD_ID'):
-        return 'runpod'
-    elif os.path.exists('/.dockerenv'):
-        return 'container'
-    else:
-        return 'local'
-
-async def main():
-    """Función principal"""
-    args = parse_arguments()
-
-    env_type = detect_environment()
-    logger.info(f"Detected environment: {env_type}")
-    
-    if env_type == 'runpod':
-        args.host = "0.0.0.0"
-        if args.port == 3000:
-            logger.info("Using RunPod default port 3000")
-        run_health_server = False
-    else:
-        run_health_server = True
-    
-    setup_logging(args)
-    setup_signal_handlers()
-    print_startup_info(args)
-    
-    if not await validate_environment(args):
-        sys.exit(1)
-    
-    global model_downloader
-    model_downloader = ModelDownloader(args.models_dir)
-    
-    global server_manager
-    server_manager = LlamaServerManager(args.server_binary)
-    
-    global embedding_manager
-    embedding_manager = EmbeddingManager()
-    
-    if args.gpu_ids:
-        specified_gpus = [int(x.strip()) for x in args.gpu_ids.split(",")]
-        available_gpus = gpu_manager.get_available_gpus(args.min_vram_gb)
-        available_gpus = [gpu_id for gpu_id in available_gpus if gpu_id in specified_gpus]
-        
-        if not available_gpus:
-            logger.error(f"Ninguna de las GPUs especificadas ({args.gpu_ids}) está disponible")
-            sys.exit(1)
-        
-        logger.info(f"Usando GPUs específicas: {available_gpus}")
-    
-    app.state.args = args
-    
-    try:
-        if run_health_server:
-            health_server = HealthCheckServer()
-            health_config = uvicorn.Config(
-                health_server.app,
-                host=args.host,
-                port=8080,
-                log_level=args.log_level.lower(),
-                access_log=False
-            )
-            health_server_instance = uvicorn.Server(health_config)
-        
-        config = uvicorn.Config(
-            app,
-            host=args.host,
-            port=args.port,
-            workers=args.workers,
-            log_level=args.log_level.lower(),
-            access_log=True,
-            reload=False
-        )
-        
-        server = uvicorn.Server(config)
-        
-        if run_health_server:
-            async with asyncio.TaskGroup() as tg:
-                tg.create_task(health_server_instance.serve())
-                tg.create_task(server.serve())
-        else:
-            await server.serve()
-            
-    except Exception as e:
-        logger.error(f"Error crítico: {e}")
-        sys.exit(1)
-    finally:
-        logger.info("Limpiando recursos...")
-        server_manager.stop_all_servers()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Configuración para desarrollo
+    uvicorn.run(
+        "main:app",  # Ajusta el nombre del archivo
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        log_level="info"
+    )
