@@ -42,7 +42,7 @@ class QueueItem:
     future: asyncio.Future
 
 class ModelManager:
-    def __init__(self, model_name: str = "unsloth/llama-2-7b-bnb-4bit"):
+    def __init__(self, model_name: str = "unsloth/Qwen3-Coder-30B-A3B-Instruct"):
         self.model_name = model_name
         self.model = None
         self.tokenizer = None
