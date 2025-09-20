@@ -3,6 +3,7 @@
 # install.sh - Instalación simple para Unsloth Batch Inference API
 
 echo "🚀 Instalando dependencias..."
+export TOKENIZERS_PARALLELISM=false
 
 # Actualizar pip
 pip install --upgrade pip
