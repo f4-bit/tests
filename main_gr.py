@@ -6,6 +6,7 @@ import asyncio
 import uuid
 import time
 from contextlib import asynccontextmanager
+from typing import Optional, Dict, Any, List
 
 class InferenceRequest(BaseModel):
     text: str
