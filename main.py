@@ -333,5 +333,6 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         reload=False,
-        log_level="info"
+        log_level="info",
+        workers=1  # Importante: usar solo 1 worker para evitar problemas con CUDA
     )
