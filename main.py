@@ -1,3 +1,11 @@
+try:
+    from unsloth import FastLanguageModel
+    import torch
+except ImportError:
+    print("Unsloth no encontrado. Usando mock para demostración.")
+    FastLanguageModel = None
+    torch = None
+
 import asyncio
 import uuid
 from typing import Optional, Dict, Any, List
@@ -11,14 +19,6 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn
 
-# Simulamos la importación de unsloth (ajusta según tu instalación)
-try:
-    from unsloth import FastLanguageModel
-    import torch
-except ImportError:
-    print("Unsloth no encontrado. Usando mock para demostración.")
-    FastLanguageModel = None
-    torch = None
 
 # Modelos de datos
 class InferenceRequest(BaseModel):

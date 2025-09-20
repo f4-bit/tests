@@ -11,6 +11,8 @@ pip install --upgrade pip
 echo "📦 Instalando PyTorch..."
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 
+pip install --upgrade torch
+
 # Instalar FastAPI y servidor
 echo "🌐 Instalando FastAPI..."
 pip install fastapi uvicorn[standard]
@@ -28,4 +30,4 @@ echo "🔧 Instalando utilidades..."
 pip install pydantic python-multipart
 
 echo "✅ ¡Instalación completada!"
-echo "Ejecuta: python main.py"
+python main.py
