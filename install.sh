@@ -2,9 +2,6 @@
 
 # install.sh - Instalación simple para Unsloth Batch Inference API
 
-export TORCHDYNAMO_VERBOSE=1
-export TORCH_LOGS="+dynamo"
-
 echo "🚀 Instalando dependencias..."
 
 # Actualizar pip
