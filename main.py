@@ -1,11 +1,6 @@
-try:
-    from unsloth import FastLanguageModel
-    import torch
-except ImportError:
-    print("Unsloth no encontrado. Usando mock para demostración.")
-    FastLanguageModel = None
-    torch = None
 
+from unsloth import FastLanguageModel
+import torch
 import asyncio
 import uuid
 from typing import Optional, Dict, Any, List

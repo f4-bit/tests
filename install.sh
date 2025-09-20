@@ -9,8 +9,9 @@ pip install --upgrade pip
 
 # Instalar PyTorch
 echo "📦 Instalando PyTorch..."
-pip uninstall -y torch torchvision torchaudio
-pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cu121
+#pip uninstall -y torch torchvision torchaudio
+#pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cu121
+# Ya tiene una versión de pytorch instalada
 
 # Instalar FastAPI y servidor
 echo "🌐 Instalando FastAPI..."
