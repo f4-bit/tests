@@ -451,7 +451,7 @@ async def clear_gpu_cache():
 if __name__ == "__main__":
     # Configuración para desarrollo
     uvicorn.run(
-        "main:app",  # Ajusta el nombre del archivo
+        "main_nu:app",  # Ajusta el nombre del archivo
         host="0.0.0.0",
         port=8000,
         reload=False,
