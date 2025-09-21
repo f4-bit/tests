@@ -81,7 +81,7 @@ class ModelManager:
                 self.model_name,
                 quantization_config=quantization_config,
                 device_map="auto",
-                torch_dtype=torch.bfloat16,
+                dtype=torch.bfloat16,
                 trust_remote_code=True,
                 attn_implementation="flash_attention_2",  # Usar Flash Attention si está disponible
                 use_cache=True
