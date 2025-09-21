@@ -54,7 +54,7 @@ class ModelManager:
                 model_name=self.model_name,
                 max_seq_length=8192,
                 dtype=torch.bfloat16,
-                load_in_4bit=False,
+                load_in_4bit=True,
             )
             
             # Habilitar inferencia rápida
