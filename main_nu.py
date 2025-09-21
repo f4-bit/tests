@@ -43,7 +43,7 @@ class QueueItem:
     system_prompt: Optional[str] = None
 
 class ModelManager:
-    def __init__(self, model_name: str = "Qwen/Qwen2.5-Coder-32B-Instruct"):
+    def __init__(self, model_name: str = "Qwen/Qwen3-Coder-30B-A3B-Instruct"):
         self.model_name = model_name
         self.model = None
         self.tokenizer = None
