@@ -53,8 +53,8 @@ class ModelManager:
             self.model, self.tokenizer = FastLanguageModel.from_pretrained(
                 model_name=self.model_name,
                 max_seq_length=8192,
-                dtype=None,
-                load_in_4bit=True,
+                dtype=torch.bfloat16,
+                load_in_4bit=False,
             )
             
             # Habilitar inferencia rápida
@@ -116,7 +116,7 @@ class ModelManager:
                     top_p=0.9 if do_sample else None,
                     repetition_penalty=1.1,
                     # Asegurar que termine en el token correcto
-                    stop_strings=["<|eot_id|>"] if hasattr(self.tokenizer, 'stop_strings') else None
+                    #stop_strings=["<|eot_id|>"] if hasattr(self.tokenizer, 'stop_strings') else None
                 )
             
             # Decodificar respuestas
