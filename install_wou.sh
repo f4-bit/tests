@@ -20,7 +20,7 @@ pip install fastapi uvicorn[standard]
 
 # Instalar dependencias ML
 echo "🤖 Instalando dependencias de ML..."
-pip install transformers accelerate bitsandbytes
+pip install transformers accelerate bitsandbytes flash_attn
 
 # Instalar utilidades
 echo "🔧 Instalando utilidades..."
