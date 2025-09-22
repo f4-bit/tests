@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from typing import Optional, Dict, Any, List
 from collections import defaultdict
 import json
+from instruction import system_prompt
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -74,7 +75,7 @@ async def lifespan(app: FastAPI):
         engine_args = AsyncEngineArgs(
             model="Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8",
             dtype="auto",
-            max_model_len=8192,
+            max_model_len=32768,
             gpu_memory_utilization=0.9,
             quantization="fp8",
             
@@ -179,9 +180,13 @@ async def process_batch_internal(requests: List[InferenceRequest]) -> List[Infer
     """Procesar un batch de requests internamente"""
     start_time = time.time()
     
-    # Preparar sampling params y request_ids
+    # Obtener el tokenizer para usar el chat template
+    tokenizer = await engine.get_tokenizer()
+    
+    # Preparar sampling params, request_ids y prompts formateados
     sampling_params_list = []
     request_ids = []
+    formatted_prompts = []
     
     for req in requests:
         request_id = req.request_id or str(uuid.uuid4())
@@ -193,17 +198,31 @@ async def process_batch_internal(requests: List[InferenceRequest]) -> List[Infer
             top_p=req.top_p,
         )
         sampling_params_list.append(sampling_params)
-    
-    # Opción alternativa: Usar add_request para batching más eficiente
-    # Para batching verdadero, podrías usar:
-    # for i, req in enumerate(requests):
-    #     await engine.add_request(request_ids[i], req.text, sampling_params_list[i])
+        
+        # Formatear el prompt usando el chat template del modelo
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": req.text}
+        ]
+        
+        try:
+            formatted_prompt = tokenizer.apply_chat_template(
+                messages, 
+                tokenize=False, 
+                add_generation_prompt=True
+            )
+        except Exception as e:
+            logger.warning(f"Error applying chat template for request {request_id}: {e}")
+            # Fallback: formateo manual para Qwen
+            formatted_prompt = f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{req.text}<|im_end|>\n<|im_start|>assistant\n"
+        
+        formatted_prompts.append(formatted_prompt)
     
     # Procesar requests de forma concurrente con vLLM AsyncEngine
     tasks = []
-    for i, req in enumerate(requests):
-        # Crear tarea para cada request
-        task = engine.generate(req.text, sampling_params_list[i], request_ids[i])
+    for i, formatted_prompt in enumerate(formatted_prompts):
+        # Usar el prompt formateado en lugar del texto crudo
+        task = engine.generate(formatted_prompt, sampling_params_list[i], request_ids[i])
         tasks.append(task)
     
     # Función auxiliar para procesar cada generador async
@@ -240,7 +259,8 @@ async def process_batch_internal(requests: List[InferenceRequest]) -> List[Infer
             generated_text = result.outputs[0].text if result.outputs else ""
             output_tokens = len(result.outputs[0].token_ids) if result.outputs else 0
         
-        input_tokens = len(req.text.split())  # Aproximación simple
+        # Calcular tokens de entrada usando el prompt formateado
+        input_tokens = len(tokenizer.encode(formatted_prompts[req_idx]))
         
         response = InferenceResponse(
             request_id=request_ids[req_idx],
