@@ -3,6 +3,10 @@
 # Script para ejecutar servidor vLLM con FastAPI
 # Uso: ./run_vllm_server.sh [puerto] [host]
 
+echo -e "${GREEN}🚀 Instalando dependencias...${NC}"
+pip install vllm fastapi uvicorn
+echo -e "${GREEN}✅ Dependencias instaladas${NC}"
+
 set -e  # Termina si hay error
 
 # Configuración por defecto
