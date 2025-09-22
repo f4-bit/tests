@@ -179,7 +179,7 @@ async def process_batch_internal(requests: List[InferenceRequest]) -> List[Infer
     """Procesar un batch de requests internamente"""
     start_time = time.time()
     
-    # Preparar sampling params para cada request
+    # Preparar sampling params y request_ids
     sampling_params_list = []
     request_ids = []
     
@@ -194,23 +194,56 @@ async def process_batch_internal(requests: List[InferenceRequest]) -> List[Infer
         )
         sampling_params_list.append(sampling_params)
     
-    # vLLM procesa automáticamente en batch cuando recibe múltiples requests
-    batch_results = []
+    # Opción alternativa: Usar add_request para batching más eficiente
+    # Para batching verdadero, podrías usar:
+    # for i, req in enumerate(requests):
+    #     await engine.add_request(request_ids[i], req.text, sampling_params_list[i])
+    
+    # Procesar requests de forma concurrente con vLLM AsyncEngine
+    tasks = []
     for i, req in enumerate(requests):
-        result = engine.generate(req.text, sampling_params_list[i], request_ids[i])
-        batch_results.append(result)
+        # Crear tarea para cada request
+        task = engine.generate(req.text, sampling_params_list[i], request_ids[i])
+        tasks.append(task)
+    
+    # Función auxiliar para procesar cada generador async
+    async def process_single_request(async_gen, req_idx):
+        """Procesa un solo request y consume su async_generator"""
+        final_output = None
+        try:
+            async for request_output in async_gen:
+                # Cada iteración contiene el estado actualizado de la generación
+                final_output = request_output
+            return final_output, req_idx
+        except Exception as e:
+            logger.error(f"Error procesando request {req_idx}: {e}")
+            return None, req_idx
+    
+    # Ejecutar todas las tareas concurrentemente
+    process_tasks = [process_single_request(task, i) for i, task in enumerate(tasks)]
+    completed_results = await asyncio.gather(*process_tasks, return_exceptions=True)
     
     # Preparar respuestas
     responses = []
     processing_time = time.time() - start_time
     
-    for i, (req, result) in enumerate(zip(requests, batch_results)):
-        generated_text = result.outputs[0].text if result.outputs else ""
-        input_tokens = len(req.text.split())
-        output_tokens = len(generated_text.split())
+    for i, (result, req_idx) in enumerate(completed_results):
+        req = requests[req_idx]
+        
+        if isinstance(result, Exception) or result is None:
+            # Manejar errores
+            logger.error(f"Error en request {req_idx}: {result}")
+            generated_text = ""
+            output_tokens = 0
+        else:
+            # Extraer texto generado del resultado final
+            generated_text = result.outputs[0].text if result.outputs else ""
+            output_tokens = len(result.outputs[0].token_ids) if result.outputs else 0
+        
+        input_tokens = len(req.text.split())  # Aproximación simple
         
         response = InferenceResponse(
-            request_id=request_ids[i],
+            request_id=request_ids[req_idx],
             generated_text=generated_text,
             processing_time=processing_time,
             input_tokens=input_tokens,
