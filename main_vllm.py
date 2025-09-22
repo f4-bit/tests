@@ -84,7 +84,7 @@ async def lifespan(app: FastAPI):
             
             # CHUNKED PREFILL OPTIMIZADO
             enable_chunked_prefill=True,
-            max_num_batched_tokens=16384,  # Debe coincidir con el anterior
+            #max_num_batched_tokens=16384,  # Debe coincidir con el anterior
             
             # OPTIMIZACIONES DE MEMORIA Y SCHEDULING
             enable_prefix_caching=True,
