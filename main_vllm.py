@@ -72,7 +72,7 @@ async def lifespan(app: FastAPI):
     
     try:
         engine_args = AsyncEngineArgs(
-            model="unsloth/Qwen2.5-Coder-32B-Instruct-bnb-4bit",
+            model="Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8",
             dtype="auto",
             max_model_len=8192,
             gpu_memory_utilization=0.9,
@@ -88,7 +88,7 @@ async def lifespan(app: FastAPI):
             
             # OPTIMIZACIONES DE MEMORIA Y SCHEDULING
             enable_prefix_caching=True,
-            use_v2_block_manager=True,
+            #use_v2_block_manager=True,
             preemption_mode="recompute",
             swap_space=4,  # GB de swap space
             
