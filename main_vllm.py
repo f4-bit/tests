@@ -197,7 +197,7 @@ async def process_batch_internal(requests: List[InferenceRequest]) -> List[Infer
     # vLLM procesa automáticamente en batch cuando recibe múltiples requests
     batch_results = []
     for i, req in enumerate(requests):
-        result = await engine.generate(req.text, sampling_params_list[i], request_ids[i])
+        result = engine.generate(req.text, sampling_params_list[i], request_ids[i])
         batch_results.append(result)
     
     # Preparar respuestas
@@ -302,7 +302,7 @@ async def health_check():
     
     return {
         "status": "healthy",
-        "model": "unsloth/Qwen2.5-Coder-32B-Instruct-bnb-4bit",
+        "model": "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8",
         "batching_enabled": True,
         "queue_size": stats.queued_requests,
         "avg_batch_size": stats.avg_batch_size,
