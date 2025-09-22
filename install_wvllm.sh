@@ -73,7 +73,7 @@ uvicorn ${PYTHON_FILE%.*}:app \
     --host "$HOST" \
     --port "$PORT" \
     --workers 1 \
-    --timeout-keep-alive 300 \
+    --timeout-keep-alive 600 \
     --access-log \
     --log-level info &
 
