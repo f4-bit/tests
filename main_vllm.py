@@ -90,7 +90,7 @@ async def lifespan(app: FastAPI):
             #max_num_batched_tokens=16384,  # Debe coincidir con el anterior
             
             # OPTIMIZACIONES DE MEMORIA Y SCHEDULING
-            enable_prefix_caching=True,
+            enable_prefix_caching=False, # Deshabilitar prefix caching para qwen3next
             #use_v2_block_manager=True,
             preemption_mode="recompute",
             swap_space=4,  # GB de swap space
