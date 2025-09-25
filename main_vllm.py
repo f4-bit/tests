@@ -77,8 +77,10 @@ async def lifespan(app: FastAPI):
             dtype="auto",
             max_model_len=32768,
             gpu_memory_utilization=0.9,
-            quantization="fp8",
+            #quantization="fp8",
             
+            # Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8
+
             # CONFIGURACIÓN AVANZADA DE BATCHING
             max_num_seqs=64,  # Reducido para mejor latencia
             max_num_batched_tokens=16384,  # Más tokens por batch
