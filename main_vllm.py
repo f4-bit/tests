@@ -197,6 +197,10 @@ async def process_batch_internal(requests: List[InferenceRequest]) -> List[Infer
             temperature=req.temperature,
             max_tokens=req.max_length,
             top_p=req.top_p,
+            extra_fields={
+                "enable_thinking": True,
+                "thinking_budget": 1000
+            }
         )
         sampling_params_list.append(sampling_params)
         
