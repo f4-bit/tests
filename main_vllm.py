@@ -73,11 +73,11 @@ async def lifespan(app: FastAPI):
     
     try:
         engine_args = AsyncEngineArgs(
-            model="Qwen/Qwen3-Coder-30B-A3B-Instruct",
+            model="Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8",
             dtype="auto",
             max_model_len=32768,
             gpu_memory_utilization=0.9,
-            #quantization="fp8",
+            quantization="fp8",
             
             # Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8
 
