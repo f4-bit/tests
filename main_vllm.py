@@ -73,11 +73,11 @@ async def lifespan(app: FastAPI):
     
     try:
         engine_args = AsyncEngineArgs(
-            model="Qwen/Qwen3-Next-80B-A3B-Instruct-FP8",
+            model="Qwen/Qwen3-Coder-30B-A3B-Instruct",
             dtype="auto",
             max_model_len=32768,
             gpu_memory_utilization=0.9,
-            quantization="fp8",
+            #quantization="fp8",
             
             # Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8
 
@@ -87,12 +87,11 @@ async def lifespan(app: FastAPI):
             
             # CHUNKED PREFILL OPTIMIZADO
             enable_chunked_prefill=True,
-            #max_num_batched_tokens=16384,  # Debe coincidir con el anterior
             
             # OPTIMIZACIONES DE MEMORIA Y SCHEDULING
-            enable_prefix_caching=False, # Deshabilitar prefix caching para qwen3next
+            enable_prefix_caching=True,
             #use_v2_block_manager=True,
-            #preemption_mode="recompute", # Deshabilitar prefix caching para qwen3next
+            preemption_mode="recompute", # Deshabilitar prefix caching para qwen3next
             swap_space=4,  # GB de swap space
             
             # CONTINUOUS BATCHING
