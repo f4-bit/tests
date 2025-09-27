@@ -197,10 +197,6 @@ async def process_batch_internal(requests: List[InferenceRequest]) -> List[Infer
             temperature=req.temperature,
             max_tokens=req.max_length,
             top_p=req.top_p,
-            extra_fields={
-                "enable_thinking": True,
-                "thinking_budget": 1000
-            }
         )
         sampling_params_list.append(sampling_params)
         
@@ -227,7 +223,10 @@ async def process_batch_internal(requests: List[InferenceRequest]) -> List[Infer
     tasks = []
     for i, formatted_prompt in enumerate(formatted_prompts):
         # Usar el prompt formateado en lugar del texto crudo
-        task = engine.generate(formatted_prompt, sampling_params_list[i], request_ids[i])
+        task = engine.generate(formatted_prompt, sampling_params_list[i], request_ids[i], **{
+        "enable_thinking": True,
+        "thinking_budget": 1000
+    })
         tasks.append(task)
     
     # Función auxiliar para procesar cada generador async
