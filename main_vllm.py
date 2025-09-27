@@ -80,9 +80,6 @@ async def lifespan(app: FastAPI):
             quantization="fp8",
             # Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8
 
-            disable_flash_attn=False,  # Asegurar que Flash Attention esté habilitado
-            attention_backend="FLASH_ATTN",  # Forzar el backend de Flash Attention
-
             # CONFIGURACIÓN AVANZADA DE BATCHING
             max_num_seqs=64,  # Reducido para mejor latencia
             max_num_batched_tokens=16384,  # Más tokens por batch
