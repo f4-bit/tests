@@ -91,7 +91,7 @@ for i in {1..30}; do
 #        echo -e "${RED}❌ Timeout: El servidor tardó demasiado en iniciar${NC}"
 #        kill $SERVER_PID 2>/dev/null || true
 #        exit 1
-    fi
+#    fi
 done
 
 # Mantener el script corriendo
