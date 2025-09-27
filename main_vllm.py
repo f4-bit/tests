@@ -78,8 +78,10 @@ async def lifespan(app: FastAPI):
             max_model_len=32768,
             gpu_memory_utilization=0.9,
             quantization="fp8",
-            
             # Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8
+
+            disable_flash_attn=False,  # Asegurar que Flash Attention esté habilitado
+            attention_backend="FLASH_ATTN",  # Forzar el backend de Flash Attention
 
             # CONFIGURACIÓN AVANZADA DE BATCHING
             max_num_seqs=64,  # Reducido para mejor latencia
@@ -94,6 +96,8 @@ async def lifespan(app: FastAPI):
             preemption_mode="recompute", # Deshabilitar prefix caching para qwen3next
             swap_space=4,  # GB de swap space
             
+            enforce_eager=False
+
             # CONTINUOUS BATCHING
             disable_log_stats=False,  # Para monitorear performance
             trust_remote_code=True,
