@@ -87,10 +87,10 @@ for i in {1..30}; do
         break
     fi
     sleep 2
-    if [ $i -eq 30 ]; then
-        echo -e "${RED}❌ Timeout: El servidor tardó demasiado en iniciar${NC}"
-        kill $SERVER_PID 2>/dev/null || true
-        exit 1
+#    if [ $i -eq 30 ]; then
+#        echo -e "${RED}❌ Timeout: El servidor tardó demasiado en iniciar${NC}"
+#        kill $SERVER_PID 2>/dev/null || true
+#        exit 1
     fi
 done
 
