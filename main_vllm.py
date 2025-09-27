@@ -96,7 +96,7 @@ async def lifespan(app: FastAPI):
             preemption_mode="recompute", # Deshabilitar prefix caching para qwen3next
             swap_space=4,  # GB de swap space
             
-            enforce_eager=False
+            enforce_eager=False,
 
             # CONTINUOUS BATCHING
             disable_log_stats=False,  # Para monitorear performance
