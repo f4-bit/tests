@@ -223,10 +223,7 @@ async def process_batch_internal(requests: List[InferenceRequest]) -> List[Infer
     tasks = []
     for i, formatted_prompt in enumerate(formatted_prompts):
         # Usar el prompt formateado en lugar del texto crudo
-        task = engine.generate(formatted_prompt, sampling_params_list[i], request_ids[i], **{
-        "enable_thinking": True,
-        "thinking_budget": 1000
-    })
+        task = engine.generate(formatted_prompt, sampling_params_list[i], request_ids[i])
         tasks.append(task)
     
     # Función auxiliar para procesar cada generador async
