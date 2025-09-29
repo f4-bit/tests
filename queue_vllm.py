@@ -1,4 +1,5 @@
 import asyncio
+import subprocess
 import uuid
 import time
 from typing import List, Dict, Optional
@@ -57,14 +58,19 @@ class QueuedRequest:
 
 # ============= Configuración =============
 class Config:
-    BACKEND_API_URL = "https://localhost:8000"
+    BACKEND_API_URL = "http://localhost:8000"
+    BACKEND_SCRIPT_PATH = "main_vllm.py"  # Ajusta esta ruta a tu script backend
     NUM_WORKERS = 3  # Número de workers concurrentes
     BATCH_SIZE = 6   # Tamaño m de peticiones por worker
     WORKER_POLL_INTERVAL = 0.1  # Segundos entre verificaciones del buffer
     REQUEST_TIMEOUT = 300  # Timeout para requests al backend
+    AUTO_START_BACKEND = True  # Flag para auto-inicio del backend
 
 
 config = Config()
+
+# Variable global para el proceso del backend
+backend_process = None
 
 
 # ============= Buffer/Queue Manager =============
@@ -222,20 +228,56 @@ async def check_backend_health():
     return False
 
 
+async def start_backend_api():
+    """Inicia la API del backend en puerto 8000"""
+    global backend_process
+    
+    try:
+        print(f"🚀 Iniciando backend API desde {config.BACKEND_SCRIPT_PATH}...")
+        backend_process = subprocess.Popen(
+            ["python", config.BACKEND_SCRIPT_PATH],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        
+        # Esperar un poco para que el servidor inicie
+        print("⏳ Esperando a que el backend inicie...")
+        await asyncio.sleep(5)
+        
+        # Verificar que esté corriendo
+        if await check_backend_health():
+            print("✓ Backend API iniciada correctamente")
+            return True
+        else:
+            print("❌ Backend API no respondió después de iniciarse")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Error iniciando backend API: {e}")
+        return False
+
+
 @app.on_event("startup")
 async def startup_event():
     """Inicia los workers al arrancar la aplicación"""
     global workers, worker_tasks
     
-    # Verificar que el backend esté disponible
-    print("Verificando disponibilidad del backend...")
-    if not await check_backend_health():
-        print(f"\n❌ ERROR: No se puede conectar al backend en {config.BACKEND_API_URL}")
-        print("Por favor, asegúrate de que la API del puerto 8000 esté corriendo.")
-        print("Puedes iniciarla manualmente o usar la opción de auto-inicio.\n")
-        # No lanzamos excepción para permitir que la app inicie, pero los workers fallarán
+    # Auto-inicio del backend si está configurado
+    if config.AUTO_START_BACKEND:
+        print("🔍 Verificando disponibilidad del backend...")
+        if not await check_backend_health():
+            print("⚠ Backend no disponible. Intentando iniciar...")
+            if not await start_backend_api():
+                print("⚠ ADVERTENCIA: No se pudo iniciar el backend automáticamente")
+                print("Por favor, verifica que el BACKEND_SCRIPT_PATH sea correcto")
+    else:
+        # Solo verificar
+        print("🔍 Verificando disponibilidad del backend...")
+        if not await check_backend_health():
+            print(f"\n❌ ERROR: No se puede conectar al backend en {config.BACKEND_API_URL}")
+            print("Por favor, inicia la API del puerto 8000 manualmente.\n")
     
-    print(f"Iniciando {config.NUM_WORKERS} workers con batch size {config.BATCH_SIZE}")
+    print(f"🚀 Iniciando {config.NUM_WORKERS} workers con batch size {config.BATCH_SIZE}")
     
     for i in range(config.NUM_WORKERS):
         worker = Worker(worker_id=i, buffer=buffer, batch_size=config.BATCH_SIZE)
@@ -243,13 +285,15 @@ async def startup_event():
         task = asyncio.create_task(worker.start())
         worker_tasks.append(task)
     
-    print("Workers iniciados correctamente")
+    print("✅ Workers iniciados correctamente")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Detiene los workers al cerrar la aplicación"""
-    print("Deteniendo workers...")
+    """Detiene los workers y el backend al cerrar la aplicación"""
+    global backend_process
+    
+    print("🛑 Deteniendo workers...")
     
     for worker in workers:
         await worker.stop()
@@ -259,7 +303,18 @@ async def shutdown_event():
         task.cancel()
     
     await asyncio.gather(*worker_tasks, return_exceptions=True)
-    print("Workers detenidos")
+    
+    # Detener el backend si lo iniciamos nosotros
+    if backend_process:
+        print("🛑 Deteniendo backend API...")
+        backend_process.terminate()
+        try:
+            backend_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            print("⚠ Backend no se detuvo a tiempo, forzando terminación...")
+            backend_process.kill()
+    
+    print("✅ Sistema detenido completamente")
 
 
 @app.get("/")
@@ -268,7 +323,9 @@ async def root():
         "message": "API Intermedia con Workers",
         "workers": config.NUM_WORKERS,
         "batch_size": config.BATCH_SIZE,
-        "queue_size": buffer.queue_size()
+        "queue_size": buffer.queue_size(),
+        "backend_url": config.BACKEND_API_URL,
+        "auto_start_enabled": config.AUTO_START_BACKEND
     }
 
 
@@ -286,7 +343,8 @@ async def get_stats():
                 "processed_batches": w.processed_batches
             }
             for w in workers
-        ]
+        ],
+        "backend_process_running": backend_process is not None and backend_process.poll() is None
     }
 
 
