@@ -57,7 +57,7 @@ class QueuedRequest:
 
 # ============= Configuración =============
 class Config:
-    BACKEND_API_URL = "http://localhost:8000"
+    BACKEND_API_URL = "https://localhost:8000"
     NUM_WORKERS = 3  # Número de workers concurrentes
     BATCH_SIZE = 6   # Tamaño m de peticiones por worker
     WORKER_POLL_INTERVAL = 0.1  # Segundos entre verificaciones del buffer
