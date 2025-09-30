@@ -64,7 +64,7 @@ class Config:
     BATCH_SIZE = 6   # Tamaño m de peticiones por worker
     WORKER_POLL_INTERVAL = 0.1  # Segundos entre verificaciones del buffer
     REQUEST_TIMEOUT = 300  # Timeout para requests al backend
-    AUTO_START_BACKEND = True  # Flag para auto-inicio del backend
+    AUTO_START_BACKEND = False  # Flag para auto-inicio del backend
     BACKEND_STARTUP_MAX_WAIT = 600  # 10 minutos para inicio del backend (incluye descarga de modelos)
 
 
