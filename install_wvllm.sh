@@ -10,7 +10,7 @@ echo -e "${GREEN}✅ Dependencias instaladas${NC}"
 set -e  # Termina si hay error
 
 # Configuración por defecto
-DEFAULT_PORT=8001
+DEFAULT_PORT=8080
 DEFAULT_HOST="localhost"
 PYTHON_FILE="queue_vllm.py"  # Cambia por el nombre de tu archivo .py
 
