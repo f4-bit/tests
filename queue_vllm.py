@@ -59,18 +59,20 @@ class QueuedRequest:
 # ============= Configuración =============
 class Config:
     BACKEND_API_URL = "http://localhost:8000"
-    BACKEND_SCRIPT_PATH = "main_vllm.py"  # Ajusta esta ruta a tu script backend
+    BACKEND_SCRIPT_PATH = "/workspace/api_vllm.py"  # Ajusta esta ruta a tu script backend
     NUM_WORKERS = 3  # Número de workers concurrentes
     BATCH_SIZE = 6   # Tamaño m de peticiones por worker
     WORKER_POLL_INTERVAL = 0.1  # Segundos entre verificaciones del buffer
     REQUEST_TIMEOUT = 300  # Timeout para requests al backend
     AUTO_START_BACKEND = True  # Flag para auto-inicio del backend
+    BACKEND_STARTUP_MAX_WAIT = 600  # 10 minutos para inicio del backend (incluye descarga de modelos)
 
 
 config = Config()
 
 # Variable global para el proceso del backend
 backend_process = None
+backend_output_tasks = []  # Para mantener las tareas de lectura de logs
 
 
 # ============= Buffer/Queue Manager =============
@@ -228,29 +230,76 @@ async def check_backend_health():
     return False
 
 
+async def stream_process_output(stream, prefix):
+    """Lee y muestra el output de un stream en tiempo real"""
+    try:
+        while True:
+            line = await asyncio.get_event_loop().run_in_executor(
+                None, stream.readline
+            )
+            if not line:
+                break
+            decoded_line = line.decode('utf-8', errors='ignore').strip()
+            if decoded_line:
+                print(f"[{prefix}] {decoded_line}")
+    except Exception as e:
+        print(f"[{prefix}] Error leyendo stream: {e}")
+
+
 async def start_backend_api():
     """Inicia la API del backend en puerto 8000"""
-    global backend_process
+    global backend_process, backend_output_tasks
     
     try:
         print(f"🚀 Iniciando backend API desde {config.BACKEND_SCRIPT_PATH}...")
+        print("📋 Mostrando logs del backend en tiempo real...")
+        print("=" * 80)
+        
         backend_process = subprocess.Popen(
             ["python", config.BACKEND_SCRIPT_PATH],
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
+            stderr=subprocess.PIPE,
+            bufsize=1,  # Line buffered
+            universal_newlines=False
         )
         
-        # Esperar un poco para que el servidor inicie
-        print("⏳ Esperando a que el backend inicie...")
-        await asyncio.sleep(5)
+        # Crear tareas para leer stdout y stderr en tiempo real
+        stdout_task = asyncio.create_task(
+            stream_process_output(backend_process.stdout, "BACKEND-OUT")
+        )
+        stderr_task = asyncio.create_task(
+            stream_process_output(backend_process.stderr, "BACKEND-ERR")
+        )
         
-        # Verificar que esté corriendo
-        if await check_backend_health():
-            print("✓ Backend API iniciada correctamente")
-            return True
-        else:
-            print("❌ Backend API no respondió después de iniciarse")
-            return False
+        # Guardar las tareas para poder cancelarlas después
+        backend_output_tasks = [stdout_task, stderr_task]
+        
+        # Esperar con reintentos más largos para dar tiempo a la descarga del modelo
+        print("⏳ Esperando a que el backend inicie (esto puede tomar varios minutos si descarga modelos)...")
+        max_wait_time = config.BACKEND_STARTUP_MAX_WAIT
+        check_interval = 10  # Verificar cada 10 segundos
+        elapsed_time = 0
+        
+        while elapsed_time < max_wait_time:
+            await asyncio.sleep(check_interval)
+            elapsed_time += check_interval
+            
+            # Verificar si el proceso murió
+            if backend_process.poll() is not None:
+                print(f"❌ El proceso del backend terminó inesperadamente (código: {backend_process.returncode})")
+                # Dar tiempo a que se impriman los logs finales
+                await asyncio.sleep(2)
+                return False
+            
+            # Verificar salud del backend
+            print(f"⏳ Verificando backend... ({elapsed_time}s / {max_wait_time}s)")
+            if await check_backend_health():
+                print("=" * 80)
+                print("✅ Backend API iniciada y respondiendo correctamente")
+                return True
+        
+        print("❌ Timeout: El backend no respondió en el tiempo esperado")
+        return False
             
     except Exception as e:
         print(f"❌ Error iniciando backend API: {e}")
@@ -291,18 +340,25 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Detiene los workers y el backend al cerrar la aplicación"""
-    global backend_process
+    global backend_process, backend_output_tasks
     
     print("🛑 Deteniendo workers...")
     
     for worker in workers:
         await worker.stop()
     
-    # Esperar a que terminen las tareas
+    # Esperar a que terminen las tareas de workers
     for task in worker_tasks:
         task.cancel()
     
     await asyncio.gather(*worker_tasks, return_exceptions=True)
+    
+    # Detener las tareas de lectura de logs del backend
+    for task in backend_output_tasks:
+        task.cancel()
+    
+    if backend_output_tasks:
+        await asyncio.gather(*backend_output_tasks, return_exceptions=True)
     
     # Detener el backend si lo iniciamos nosotros
     if backend_process:
@@ -310,9 +366,11 @@ async def shutdown_event():
         backend_process.terminate()
         try:
             backend_process.wait(timeout=10)
+            print("✅ Backend detenido correctamente")
         except subprocess.TimeoutExpired:
             print("⚠ Backend no se detuvo a tiempo, forzando terminación...")
             backend_process.kill()
+            backend_process.wait()
     
     print("✅ Sistema detenido completamente")
 
@@ -407,4 +465,4 @@ async def inference_batch(request: BatchInferenceRequestAPI):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=8001)
