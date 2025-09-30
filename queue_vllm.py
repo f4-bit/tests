@@ -156,6 +156,7 @@ class Worker:
         
         try:
             # Preparar payload para el backend
+            print(f"Worker {self.worker_id} iniciando batch {batch_id} con {len(batch)} requests")
             payload = {
                 "texts": [req.text for req in batch],
                 "max_length": batch[0].max_length,
@@ -175,12 +176,21 @@ class Worker:
                 response.raise_for_status()
                 result_data = response.json()
             
+            print(f"Worker {self.worker_id} recibió response: {response.status_code}")
+            result_data = response.json()
+            print(f"Worker {self.worker_id} result_data keys: {result_data.keys()}")
+            print(f"Worker {self.worker_id} num results: {len(result_data.get('results', []))}")
+
             # Distribuir resultados
             results = result_data.get("results", [])
+            print(f"Worker {self.worker_id} distribuyendo {len(results)} resultados a {len(batch)} requests")
             for i, req in enumerate(batch):
+                print(f"Worker {self.worker_id} procesando resultado {i} para request {req.request_id}")
+
                 if i < len(results):
                     inference_result = InferenceResponse(**results[i])
                     await self.buffer.set_result(req.request_id, inference_result)
+                    print(f"Worker {self.worker_id} resultado {i} completado")
                 else:
                     await self.buffer.set_error(
                         req.request_id,
