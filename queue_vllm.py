@@ -418,12 +418,12 @@ async def get_stats():
 
 @app.post("/inference", response_model=InferenceResponse)
 async def inference_single(request: SingleInferenceRequest):
-    """Endpoint para una sola petición de inferencia"""
-    request_id = request.request_id or str(uuid.uuid4())
+    # SIEMPRE generar un ID único interno, ignorar el del usuario
+    internal_request_id = str(uuid.uuid4())
+    user_request_id = request.request_id  # Guardar el del usuario para la respuesta
     
-    # Crear petición en cola
     queued_req = QueuedRequest(
-        request_id=request_id,
+        request_id=internal_request_id,  # Usar ID interno único
         text=request.text,
         max_length=request.max_length,
         temperature=request.temperature,
@@ -431,17 +431,16 @@ async def inference_single(request: SingleInferenceRequest):
         timestamp=time.time()
     )
     
-    # Agregar al buffer y esperar resultado
     future = await buffer.add_request(queued_req)
     
     try:
-        # Esperar resultado (con timeout)
         result = await asyncio.wait_for(future, timeout=config.REQUEST_TIMEOUT)
+        # Reemplazar el request_id interno con el del usuario en la respuesta
+        if user_request_id:
+            result.request_id = user_request_id
         return result
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="Timeout esperando respuesta del backend")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error procesando petición: {str(e)}")
 
 
 @app.post("/inference/batch", response_model=List[InferenceResponse])
