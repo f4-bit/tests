@@ -60,7 +60,7 @@ class QueuedRequest:
 class Config:
     BACKEND_API_URL = "http://localhost:8000"
     BACKEND_SCRIPT_PATH = "main_vllm.py"  # Ajusta esta ruta a tu script backend
-    NUM_WORKERS = 7  # Número de workers concurrentes
+    NUM_WORKERS = 8  # Número de workers concurrentes
     BATCH_SIZE = 6   # Tamaño m de peticiones por worker
     WORKER_POLL_INTERVAL = 0.1  # Segundos entre verificaciones del buffer
     REQUEST_TIMEOUT = 300  # Timeout para requests al backend
