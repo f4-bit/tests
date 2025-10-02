@@ -144,7 +144,7 @@ async def batch_processor():
             
             # Esperar por requests con timeout
             try:
-                while len(batch_requests) < 32 and (time.time() - batch_start) < 0.1:  # 100ms max wait
+                while len(batch_requests) < 32: # Por qué 32?  <----------------
                     priority, (request, future) = await asyncio.wait_for(
                         request_queue.get(), timeout=0.05
                     )
